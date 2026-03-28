@@ -39,7 +39,7 @@
     }
   },
   "name": "MCR-ALS+PLSR",
-  "elapsed_s": 2.713127613067627,
+  "elapsed_s": 2.9730687141418457,
   "best_lv": 10,
   "loo_r2": 0.785628080368042,
   "train_metrics": {

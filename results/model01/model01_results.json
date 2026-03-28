@@ -39,7 +39,7 @@
     }
   },
   "name": "Softmax Regression",
-  "elapsed_s": 1.897878646850586,
+  "elapsed_s": 2.0047953128814697,
   "train_metrics": {
     "r2": 0.6046566367149353,
     "mae": 0.06207108497619629,
