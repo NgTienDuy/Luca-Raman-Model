@@ -1,0 +1,79 @@
+{
+  "model": 9,
+  "tool_usage": {
+    "SG": 0.10100446428570865,
+    "SNIP": 0.15290178571427718,
+    "ALS": 0.26339285714284244,
+    "SNV": 0.055803571428568316,
+    "Deriv": 0.1289062499999928,
+    "MSC": 0.1227678571428503,
+    "Cosmic": 0.07031249999999607,
+    "Area": 0.10491071428570843
+  },
+  "profile": {
+    "pH_score": 0.32897479467664537,
+    "pH_label": "ki\u1ec1m",
+    "polarity": 0.52072774569868,
+    "hydrophilicity": 0.5043718032926959,
+    "hydrophobicity": 0.495628196707304,
+    "bond_strength": 0.671458940271297,
+    "aromaticity": 0.01946096607233128,
+    "amide_I_III_ratio": 1.016112117089757,
+    "amide_I_pos_cm": 1332.5493036905925,
+    "secondary_structure": "mixed",
+    "aliphatic_index": 0.22170073814635058,
+    "carboxylate_ratio": 0.2169740625970544,
+    "amine_ratio": 0.1479575451321152,
+    "CN_CC_ratio": 0.6991989347756169,
+    "crystallinity_proxy": 3.4297997625815033,
+    "spectral_entropy": 5.271668364604314,
+    "dominant_bond": "COO-",
+    "top3_bonds": [
+      "N-H/C-H",
+      "COO-",
+      "C-N"
+    ],
+    "estimated_pI": 5.219208390983694,
+    "estimated_mw": 142.34167809788758,
+    "estimated_hydrophobicity": -2.4254289973963754,
+    "bond_intensities": {
+      "C-H bend": 0.36939376577114064,
+      "C=O": 0.01226450610571798,
+      "C-N": 0.8447219043349227,
+      "C-C-N": 0.03224677217319064,
+      "C-S/C-Cl": 0.359295496668589,
+      "COO-": 1.3263577201093237,
+      "C=C/C=N": 0.11752340387708197,
+      "CH2/CH3": 0.2983635363634676,
+      "N-H/C-H": 1.3244040807088215,
+      "C-C": 0.6753092408180237,
+      "C-O/C-N+": 0.5474908413986365,
+      "NH3+/NH2": 0.05001962311568301,
+      "C-C-C": 0.09937700629234314
+    },
+    "bond_weights": {
+      "C-H bend": 0.06084623836096348,
+      "C=O": 0.0021545497451849363,
+      "C-N": 0.13920546608164255,
+      "C-C-N": 0.005462696838160662,
+      "C-S/C-Cl": 0.058605710627273065,
+      "COO-": 0.2169740625970544,
+      "C=C/C=N": 0.01946096607233128,
+      "CH2/CH3": 0.04987704710080793,
+      "N-H/C-H": 0.22007962416967372,
+      "C-C": 0.1109774526845791,
+      "C-O/C-N+": 0.09086817794451744,
+      "NH3+/NH2": 0.008752079050472636,
+      "C-C-C": 0.016735928710771963
+    },
+    "comments": {
+      "pH": "Ki\u1ec1m r\u00f5 r\u1ec7t (+0.329) \u2014 NH\u2083\u207a chi\u1ebfm \u01b0u th\u1ebf, pH ~7.5\u20139",
+      "polarity": "Trung b\u00ecnh (0.521) \u2014 c\u00f3 C=O, N\u2013H nh\u01b0ng c\u00e2n b\u1eb1ng",
+      "hydrophilicity": "Trung b\u00ecnh (0.504) \u2014 t\u01b0\u01a1ng \u0111\u1ed1i \u01b0a n\u01b0\u1edbc",
+      "bond_strength": "Trung b\u00ecnh (0.671) \u2014 C\u2013C v\u00e0 C\u2013N ch\u1ee7 \u0111\u1ea1o",
+      "aromaticity": "Ph\u00e1t hi\u1ec7n nh\u1eb9 (0.0195) \u2014 c\u00f3 th\u1ec3 c\u00f3 v\u00f2ng th\u01a1m",
+      "amide_ratio": "C\u00e2n b\u1eb1ng (1.016) \u2014 c\u1ea5u tr\u00fac h\u1ed7n h\u1ee3p",
+      "crystallinity": "Trung b\u00ecnh (3.43) \u2014 tinh th\u1ec3 m\u1ed9t ph\u1ea7n"
+    }
+  }
+}
