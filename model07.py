@@ -1,143 +1,239 @@
-"""model07.py — CNN + Bond-Region Attention"""
-import numpy as np, time, os
-import torch, torch.nn as nn, torch.optim as optim
-from utils import (preprocess_batch, evaluate, print_metrics, save_torch_checkpoint,
-                   load_torch_checkpoint, save_results, plot_predictions,
-                   plot_predictions_raw, plot_loss_curves, plot_bond_detect_batch,
-                   kl_div_loss, get_logger, get_device, INTERRUPTER)
-from spectral_knowledge import get_active_regions
-from config import MODEL_CONFIGS, LABEL_COLS, SAVE_EVERY_N_EPOCHS, get_model_dir
-log=get_logger("model07"); CFG=MODEL_CONFIGS[7]; DEV=get_device()
+"""
+Model 07: Spectral Feature Extraction Optimizer.
+Multi-head attention over bond regions. Dictionary learning approach.
+Multi-task loss: L_KL + λ_pos·L_pos + λ_int·L_int + λ_bond·L_bondtype + λ_attn·H(A)
+"""
+import os, time, logging, gc
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset
 
-class BondAttnCNN(nn.Module):
-    def __init__(self,in_len,ch,kernels,n_bonds,ent_lam,dropout=0.4,out=6):
+import config as C
+from utils import (preprocess_batch, compute_metrics, softmax_normalize, plot_scatter_aggregated, plot_scatter_raw,
+                   plot_loss_curve, save_results, set_seeds)
+from spectral_knowledge import REGIONS, N_REGIONS, extract_bond_features
+from model_helpers import post_process_advanced_model
+
+log = logging.getLogger(__name__)
+MODEL_NUM = 7
+
+
+class BondAttentionNet(nn.Module):
+    def __init__(self, in_dim, n_regions, drop=0.3):
         super().__init__()
-        self.ent_lam=ent_lam; self.n_bonds=n_bonds
-        enc=[]; prev=1
-        for c,k in zip(ch,kernels):
-            enc+=[nn.Conv1d(prev,c,k,padding=k//2),nn.BatchNorm1d(c),nn.ReLU(),nn.Dropout(dropout),nn.MaxPool1d(2)]; prev=c
-        self.enc=nn.Sequential(*enc)
-        w=torch.ones(9)/9; self.sg_w=nn.Parameter(w); self.pad=4
-        self.attn=nn.Sequential(nn.Linear(n_bonds*prev,128),nn.ReLU(),nn.Linear(128,n_bonds))
-        self.head=nn.Sequential(nn.Linear(prev,64),nn.ReLU(),nn.Dropout(0.4),nn.Linear(64,out))
-        self.ch_last=prev
-    def forward(self,x,bond_centers):
-        w=torch.softmax(self.sg_w,0).view(1,1,-1)
-        xp=nn.functional.pad(x.unsqueeze(1),(self.pad,self.pad),mode="reflect")
-        x=nn.functional.conv1d(xp,w).squeeze(1)
-        feats=self.enc(x.unsqueeze(1)); B,C,L=feats.shape
-        bf=[]; [bf.append(feats[:,:,max(0,min(int(p*L),L-1))]) for p in bond_centers]
-        bf=torch.stack(bf,dim=1); attn=torch.softmax(self.attn(bf.reshape(B,-1)),dim=-1)
-        ctx=(bf*attn.unsqueeze(-1)).sum(1)
-        return torch.softmax(self.head(ctx),dim=-1),attn
-    def entropy_loss(self,attn): return -(-(attn*torch.log(attn.clamp(1e-8))).sum(-1)).mean()
+        self.n_regions = n_regions
+        bond_feat_dim = n_regions * 5  # 5 features per region
+        deriv_dim = 16  # 8 segments * 2
 
-def _bond_centers(wns,regions):
-    wmin,wmax=float(wns.min()),float(wns.max()); r=wmax-wmin+1e-6
-    return [((br.wn_min+br.wn_max)/2-wmin)/r for br in regions]
+        # Bond feature encoder
+        self.bond_enc = nn.Sequential(
+            nn.Linear(bond_feat_dim + deriv_dim, 128),
+            nn.ReLU(),
+            nn.Dropout(drop * 0.5),
+        )
 
-def _aug(X,Y,n=5):
-    Xa,Ya=[X],[Y]
-    for _ in range(n): Xa.append(X+np.random.randn(*X.shape).astype(np.float32)*0.01); Ya.append(Y)
-    for _ in range(n):
-        idx=np.random.randint(len(X),size=len(X)); lam=np.random.beta(0.3,0.3,size=(len(X),1)).astype(np.float32)
-        Xa.append(lam*X+(1-lam)*X[idx]); Ya.append(lam*Y+(1-lam)*Y[idx])
-    return np.vstack(Xa).astype(np.float32),np.vstack(Ya).astype(np.float32)
+        # Spectral encoder
+        self.spec_enc = nn.Sequential(
+            nn.Linear(in_dim, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.Dropout(drop),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+        )
 
-def run(X_train,X_test,Y_train,Y_test,wavenumbers=None,retrain=False,
-        X_test_raw=None,Y_test_raw=None,sid_test_raw=None,**kw):
-    log.info("="*60); log.info("Model 7 — CNN + Bond Attention")
-    log.info(f"  N_train={len(X_train)}, N_test={len(X_test)}"); log.info("="*60)
-    if wavenumbers is None: wavenumbers=np.linspace(267,2004,X_train.shape[1])
-    regions=get_active_regions(wavenumbers); centers=_bond_centers(wavenumbers,regions)
-    n_bonds=len(regions)
-    Xtr=preprocess_batch(X_train,"full"); Xte=preprocess_batch(X_test,"full")
-    from sklearn.preprocessing import StandardScaler
-    sc=StandardScaler(); Xtr=sc.fit_transform(Xtr).astype(np.float32); Xte=sc.transform(Xte).astype(np.float32)
-    Xtr_aug,Ytr_aug=_aug(Xtr,Y_train,n=CFG["n_aug"])
-    model=BondAttnCNN(Xtr.shape[1],CFG["channels"],CFG["kernels"],n_bonds,CFG["entropy_lambda"],dropout=CFG["dropout"]).to(DEV)
-    log.info(f"  Params: {sum(p.numel() for p in model.parameters()):,}")
-    opt=optim.AdamW(model.parameters(),lr=CFG["lr"],weight_decay=CFG["weight_decay"])
-    sch=optim.lr_scheduler.CosineAnnealingWarmRestarts(opt,T_0=50,T_mult=2)
-    start_ep=0; best_val=np.inf; no_imp=0; hist={"loss":{"train":[],"val":[]}}
-    if not retrain:
-        ck=load_torch_checkpoint(7,"resume")
-        if ck:
-            model.load_state_dict(ck["model"]); opt.load_state_dict(ck["opt"])
-            sch.load_state_dict(ck["sch"]); start_ep=ck["epoch"]+1; best_val=ck["best_val"]
-            hist=ck["hist"]; no_imp=ck["no_imp"]; log.info(f"  Resume ep {start_ep}")
-        else:
-            ck2=load_torch_checkpoint(7,"best")
-            if ck2:
-                model.load_state_dict(ck2["model"]); model.eval()
-                with torch.no_grad(): Yp,_=model(torch.tensor(Xte),centers); Yp=Yp.numpy()
-                m=evaluate(Y_test,Yp,LABEL_COLS); print_metrics(m,"M7 Test(ck)",2); return Yp,m
-    n_val=max(2,int(0.2*len(Xtr))); idx=np.random.RandomState(42).permutation(len(Xtr)); va_idx=idx[:n_val]
-    def _iter(X,Y,bs,sh=True):
-        N=len(X); perm=np.random.permutation(N) if sh else np.arange(N)
-        for i in range(0,N,bs):
-            b=perm[i:i+bs]; yield torch.tensor(X[b]).to(DEV),torch.tensor(Y[b]).to(DEV)
-    INTERRUPTER.reset(); t0=time.time()
-    for ep in range(start_ep,CFG["max_epochs"]):
-        if INTERRUPTER.stop_requested: break
-        model.train(); tl=0.; nb=0
-        for Xb,Yb in _iter(Xtr_aug,Ytr_aug,CFG["batch_size"]):
-            opt.zero_grad(); pred,attn=model(Xb,centers)
-            loss=kl_div_loss(pred,Yb)+CFG["entropy_lambda"]*model.entropy_loss(attn)
-            loss.backward(); nn.utils.clip_grad_norm_(model.parameters(),2.); opt.step(); tl+=loss.item(); nb+=1
-        sch.step(); tl/=max(nb,1)
+        # Multi-head attention over regions
+        self.attn_q = nn.Linear(128, n_regions)
+        self.attn_k = nn.Linear(128, n_regions)
+
+        # Fusion
+        self.fusion = nn.Sequential(
+            nn.Linear(256, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Dropout(drop),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+        )
+
+        self.head = nn.Linear(64, C.NUM_AA)
+
+        # Auxiliary heads for multi-task
+        self.peak_pos_head = nn.Linear(64, n_regions)  # predicted peak positions
+        self.peak_int_head = nn.Linear(64, n_regions)  # predicted intensities
+
+    def forward(self, x_spec, x_bond):
+        spec_feat = self.spec_enc(x_spec)  # (B, 128)
+        bond_feat = self.bond_enc(x_bond)  # (B, 128)
+
+        # Attention
+        q = self.attn_q(spec_feat)  # (B, n_regions)
+        k = self.attn_k(bond_feat)  # (B, n_regions)
+        attn = F.softmax(q * k / (self.n_regions ** 0.5), dim=-1)  # (B, n_regions)
+
+        # Weight bond features by attention
+        bond_weighted = bond_feat * attn.sum(dim=-1, keepdim=True)
+
+        fused = torch.cat([spec_feat, bond_weighted], dim=-1)
+        feat = self.fusion(fused)
+
+        pred = F.softmax(self.head(feat), dim=-1)
+        peak_pos = self.peak_pos_head(feat)
+        peak_int = self.peak_int_head(feat)
+
+        return pred, peak_pos, peak_int, attn
+
+
+def kl_loss(pred, target):
+    pred = torch.clamp(pred, 1e-8, 1.0)
+    target = torch.clamp(target, 1e-8, 1.0)
+    return F.kl_div(pred.log(), target, reduction='batchmean')
+
+
+def entropy_loss(attn):
+    """Encourage attention entropy (spread)."""
+    attn = torch.clamp(attn, 1e-8, 1.0)
+    return -torch.mean(torch.sum(attn * attn.log(), dim=-1))
+
+
+def _extract_bond_batch(X, wavenumbers):
+    """Extract bond + derivative features for batch."""
+    from spectral_knowledge import extract_bond_features, extract_derivative_features
+    feats = []
+    for i in range(len(X)):
+        bf = extract_bond_features(X[i], wavenumbers, REGIONS).flatten()
+        df = extract_derivative_features(X[i], wavenumbers)
+        feats.append(np.concatenate([bf, df]))
+    return np.array(feats, dtype=np.float32)
+
+
+def _extract_targets(X, wavenumbers):
+    """Extract peak positions and intensities as auxiliary targets."""
+    n = len(X)
+    pos = np.zeros((n, N_REGIONS), dtype=np.float32)
+    ints = np.zeros((n, N_REGIONS), dtype=np.float32)
+    for i in range(n):
+        bf = extract_bond_features(X[i], wavenumbers, REGIONS)
+        pos[i] = bf[:, 2]  # peak_position
+        ints[i] = bf[:, 1]  # peak_height
+    return pos, ints
+
+
+def run(X_train, X_val, X_test, Y_train, Y_val, Y_test,
+        wavenumbers=None, retrain=False, **kw):
+    set_seeds()
+    t0 = time.time()
+    save_dir = os.path.join(C.RESULTS_DIR, f"model{MODEL_NUM:02d}")
+    os.makedirs(save_dir, exist_ok=True)
+    ckpt_path = os.path.join(C.CHECKPOINTS_DIR, f"model{MODEL_NUM:02d}.pt")
+    sid_test = kw.get("sid_test")
+
+    log.info("M07: Preprocessing and feature extraction...")
+    Xtr = preprocess_batch(X_train, 'sg_snv')
+    Xv = preprocess_batch(X_val, 'sg_snv')
+    Xt = preprocess_batch(X_test, 'sg_snv')
+
+    bf_tr = _extract_bond_batch(Xtr, wavenumbers)
+    bf_v = _extract_bond_batch(Xv, wavenumbers)
+    bf_t = _extract_bond_batch(Xt, wavenumbers)
+
+    pos_tr, int_tr = _extract_targets(Xtr, wavenumbers)
+    pos_v, int_v = _extract_targets(Xv, wavenumbers)
+
+    # Normalize targets
+    pos_mean, pos_std = pos_tr.mean(), pos_tr.std() + 1e-8
+    int_mean, int_std = int_tr.mean(), int_tr.std() + 1e-8
+    pos_tr_n = (pos_tr - pos_mean) / pos_std
+    int_tr_n = (int_tr - int_mean) / int_std
+
+    D = Xtr.shape[1]
+    Xtr_t = torch.tensor(Xtr, dtype=torch.float32)
+    Xv_t = torch.tensor(Xv, dtype=torch.float32)
+    Xt_t = torch.tensor(Xt, dtype=torch.float32)
+    bf_tr_t = torch.tensor(bf_tr, dtype=torch.float32)
+    bf_v_t = torch.tensor(bf_v, dtype=torch.float32)
+    bf_t_t = torch.tensor(bf_t, dtype=torch.float32)
+    Ytr_t = torch.tensor(Y_train, dtype=torch.float32)
+    Yv_t = torch.tensor(Y_val, dtype=torch.float32)
+    pos_tr_t = torch.tensor(pos_tr_n, dtype=torch.float32)
+    int_tr_t = torch.tensor(int_tr_n, dtype=torch.float32)
+
+    model = BondAttentionNet(D, N_REGIONS, C.DROPOUT)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=C.LR, weight_decay=C.WEIGHT_DECAY)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2)
+
+    ds = TensorDataset(Xtr_t, bf_tr_t, Ytr_t, pos_tr_t, int_tr_t)
+    loader = DataLoader(ds, batch_size=C.BATCH_SIZE, shuffle=True)
+
+    train_losses, val_losses = [], []
+    best_val = float('inf')
+    patience_ctr = 0
+
+    log.info("M07: Training...")
+    for epoch in range(C.MAX_EPOCHS):
+        model.train()
+        ep_loss = 0
+        nb = 0
+        for xs, xb, yb, pb, ib in loader:
+            pred, pp, pi, attn = model(xs, xb)
+            l_kl = kl_loss(pred, yb)
+            l_pos = F.mse_loss(pp, pb)
+            l_int = F.mse_loss(pi, ib)
+            l_ent = entropy_loss(attn)
+            loss = l_kl + C.LAMBDA_POS * l_pos + C.LAMBDA_INT * l_int + C.LAMBDA_ATTN * l_ent
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            ep_loss += loss.item()
+            nb += 1
+
+        scheduler.step()
+        train_losses.append(ep_loss / max(nb, 1))
+
         model.eval()
         with torch.no_grad():
-            p,_=model(torch.tensor(Xtr[va_idx]).to(DEV),centers)
-            vl=kl_div_loss(p,torch.tensor(Y_train[va_idx]).to(DEV)).item()
-        hist["loss"]["train"].append(tl); hist["loss"]["val"].append(vl)
-        if ep%20==0: log.info(f"  Ep{ep:4d}: tr={tl:.5f} val={vl:.5f}")
-        if vl<best_val: best_val=vl; no_imp=0; save_torch_checkpoint(7,{"model":model.state_dict()},"best")
-        else: no_imp+=1
-        if ep%SAVE_EVERY_N_EPOCHS==0:
-            save_torch_checkpoint(7,{"model":model.state_dict(),"opt":opt.state_dict(),"sch":sch.state_dict(),"epoch":ep,"best_val":best_val,"hist":hist,"no_imp":no_imp},"resume")
-        if no_imp>=CFG["patience"]: log.info(f"  Early stop ep {ep}"); break
-    ck2=load_torch_checkpoint(7,"best")
-    if ck2: model.load_state_dict(ck2["model"])
+            vp, _, _, _ = model(Xv_t, bf_v_t)
+            vl = kl_loss(vp, Yv_t).item()
+        val_losses.append(vl)
+
+        if vl < best_val:
+            best_val = vl
+            patience_ctr = 0
+            torch.save({'model': model.state_dict(), 'epoch': epoch + 1}, ckpt_path)
+        else:
+            patience_ctr += 1
+
+        if (epoch + 1) % 10 == 0:
+            log.info(f"  Epoch {epoch+1}: train={train_losses[-1]:.4f}, val={vl:.4f}")
+        if patience_ctr >= C.PATIENCE:
+            log.info(f"  Early stopping at epoch {epoch+1}")
+            break
+
+    if os.path.exists(ckpt_path):
+        model.load_state_dict(torch.load(ckpt_path, map_location='cpu', weights_only=False)['model'])
+
     model.eval()
     with torch.no_grad():
-        Yp_te,attn_te=model(torch.tensor(Xte),centers); Yp_te=Yp_te.numpy(); attn_te=attn_te.numpy()
-        Yp_tr,_=model(torch.tensor(Xtr),centers); Yp_tr=Yp_tr.numpy()
-    mtr=evaluate(Y_train,Yp_tr,LABEL_COLS); mte=evaluate(Y_test,Yp_te,LABEL_COLS)
-    elapsed=time.time()-t0; log.info(f"  Time: {elapsed:.1f}s")
-    print_metrics(mtr,"M7 Train",2); print_metrics(mte,"M7 Test",2)
+        Y_pred, _, _, _ = model(Xt_t, bf_t_t)
+        Y_pred = Y_pred.numpy()
+    Y_pred = softmax_normalize(Y_pred)
 
-    # Bond detection for test samples
-    if X_test_raw is not None:
-        Xte_raw_proc=preprocess_batch(X_test_raw,"full")
-        unique_test_sids=list(dict.fromkeys(sid_test_raw))
-        for sid in unique_test_sids:
-            mask=sid_test_raw==sid; s_rep=np.median(Xte_raw_proc[mask],axis=0)
-            idx_s=np.where(mask)[0][0]
-            plot_bond_detect_batch(s_rep[None],wavenumbers,[sid],7,"CNN+BondAttn",Y_test_raw[idx_s:idx_s+1],LABEL_COLS)
-        Xte_r=sc.transform(Xte_raw_proc).astype(np.float32)
-        with torch.no_grad(): Yp_r,_=model(torch.tensor(Xte_r),centers); Yp_r=Yp_r.numpy()
-        plot_predictions_raw(Y_test_raw,Yp_r,sid_test_raw,7,"CNN+BondAttn",LABEL_COLS)
+    metrics = compute_metrics(Y_test, Y_pred, D)
+    metrics["epochs"] = len(train_losses)
+    metrics["training_time"] = time.time() - t0
 
-    # Attention bar chart
-    mean_attn=attn_te.mean(0)
-    import matplotlib.pyplot as plt
-    fig,ax=plt.subplots(figsize=(10,4))
-    ax.bar([br.name for br in regions],mean_attn,color="coral")
-    ax.set_title("Bond-Region Attention Weights"); ax.tick_params(axis="x",rotation=45); plt.tight_layout()
-    plt.savefig(os.path.join(get_model_dir(7),"model07_bond_attention.png"),dpi=100,bbox_inches="tight"); plt.close()
+    log.info(f"M07: Test R²={metrics['R2']:.4f}, MAE={metrics['MAE']:.4f}")
 
-    plot_loss_curves(hist,7,"CNN+BondAttn"); plot_predictions(Y_test,Yp_te,7,"CNN+BondAttn",LABEL_COLS)
-    save_results(7,mte,{"Y_pred":Yp_te,"Y_true":Y_test,"attn":attn_te},
-                 {"name":"CNN+Bond Attention","elapsed_s":elapsed,
-                  "mean_attention":{br.name:float(w) for br,w in zip(regions,mean_attn)},"train_metrics":mtr})
-    try:
-        from chemistry_report import batch_chemistry,mean_profile,format_report,plot_bond_contribution
-        from dataclasses import asdict; import json
-        md=get_model_dir(7); avg=mean_profile(batch_chemistry(Xtr,wavenumbers,Y_train,LABEL_COLS))
-        print(format_report(avg,"Model 7 — CNN+Bond Attention",show_composition=True))
-        plot_bond_contribution(avg,"M7-CNN-BondAttn",os.path.join(md,"model07_chemistry_bonds.png"))
-        with open(os.path.join(md,"model07_chemistry.json"),"w") as ff:
-            json.dump({"model":7,"profile":asdict(avg),"mean_attention":{br.name:float(w) for br,w in zip(regions,mean_attn)}},ff,indent=2,default=lambda x:float(x) if hasattr(x,"__float__") else str(x))
-    except Exception as ce: log.warning(f"  Chemistry: {ce}")
-    return Yp_te,mte
+    plot_loss_curve(train_losses, val_losses, MODEL_NUM, save_dir)
+    plot_scatter_aggregated(Y_test, Y_pred, sid_test, MODEL_NUM, save_dir)
+    plot_scatter_raw(Y_test, Y_pred, sid_test, MODEL_NUM, save_dir)
+    save_results(metrics, MODEL_NUM, save_dir)
+
+    avg_chem = post_process_advanced_model(Xt, wavenumbers, Y_pred, sid_test, MODEL_NUM, save_dir)
+    metrics["chemistry"] = avg_chem
+
+    gc.collect()
+    return Y_pred, metrics

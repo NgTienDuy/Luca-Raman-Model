@@ -1,256 +1,264 @@
-"""run_all_models.py v5 — runner"""
-import os, sys, time, json, argparse, traceback
+"""
+CLI runner: load data → split → run models → comparison.
+Usage:
+  python run_all_models.py --data data.csv
+  python run_all_models.py --data data.csv --models 1,4,7
+  python run_all_models.py --data data.csv --retrain
+  python run_all_models.py --compare-only
+"""
+import os, sys, json, time, logging, argparse, gc, traceback
 import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
-os.environ["CUDA_VISIBLE_DEVICES"] = ""
+import config as C
+from utils import load_data, split_data, set_seeds
 
-from config import MODEL_NAMES, RESULTS_DIR, COMPARISON_DIR, LABEL_COLS, DATA_FILE
-from utils import (load_data, aggregate_by_sample, split_data,
-                   plot_summary_table,
-                   evaluate, print_metrics, plot_comparison,
-                   get_logger, load_results, INTERRUPTER)
-
-log = get_logger("runner")
+log = logging.getLogger("runner")
 
 
-def _import(mid):
-    import importlib
-    return importlib.import_module({1:"model01",2:"model02",3:"model03",4:"model04",
-                                    5:"model05",6:"model06",7:"model07",8:"model08",
-                                    9:"model09",10:"model10"}[mid])
+def run_model(num, X_train, X_val, X_test, Y_train, Y_val, Y_test,
+              wavenumbers, retrain, kw):
+    """Import and run a single model."""
+    mod = __import__(f"model{num:02d}")
+    return mod.run(X_train, X_val, X_test, Y_train, Y_val, Y_test,
+                   wavenumbers=wavenumbers, retrain=retrain, **kw)
 
 
-def run_model(mid, X_tr, X_te, Y_tr, Y_te, wns, retrain,
-              X_te_raw=None, Y_te_raw=None, sid_te_raw=None):
-    t0 = time.time()
-    try:
-        mod = _import(mid)
-        kw  = dict(X_train=X_tr, X_test=X_te, Y_train=Y_tr, Y_test=Y_te, retrain=retrain,
-                   X_test_raw=X_te_raw, Y_test_raw=Y_te_raw, sid_test_raw=sid_te_raw)
-        if mid in (3,6,7,8,9,10):
-            kw["wavenumbers"] = wns
-        Y_pred, metrics = mod.run(**kw)
-        elapsed = time.time()-t0
-        return {"model_id":mid, "name":MODEL_NAMES[mid],
-                "metrics":metrics, "elapsed_s":elapsed}
-    except MemoryError:
-        log.error(f"  ✗ Model {mid}: HET RAM"); return None
-    except KeyboardInterrupt:
-        log.warning(f"  Model {mid} bi gian doan"); raise
-    except Exception as e:
-        log.error(f"  ✗ Model {mid}: {e}")
-        log.error(traceback.format_exc()); return None
+def generate_comparison(all_results):
+    """Generate all comparison outputs."""
+    comp_dir = os.path.join(C.RESULTS_DIR, "comparison")
+    os.makedirs(comp_dir, exist_ok=True)
 
-
-def _print_table(all_res):
-    for mid in sorted(all_res.keys()):
-        r=all_res[mid]; m=r.get("metrics",{})
-        r2=m.get("r2",float("nan")); mae=m.get("mae",float("nan"))
-        rmse=m.get("rmse",float("nan")); t=r.get("elapsed_s",float("nan"))
-        nm=r.get("name",MODEL_NAMES.get(mid,f"M{mid}"))
-        print(f"  {mid:>3}  {nm:<35}  {r2:>8.4f}  {mae:>8.4f}  {rmse:>8.4f}  {t:>9.1f}s")
-    valid={k:v for k,v in all_res.items()
-           if not np.isnan(v.get("metrics",{}).get("r2",float("nan")))}
-    if valid:
-        best=max(valid,key=lambda k:valid[k]["metrics"]["r2"])
-    print()
+    # ── comparison_table.csv ────────────────────────────────────────────
     import csv
-    csv_path = os.path.join(COMPARISON_DIR, "comparison_table.csv")
-    with open(csv_path,"w",newline="") as f:
-        w=csv.writer(f)
-        w.writerow(["model_id","name","r2","mae","rmse","mse","elapsed_s"])
-        for mid in sorted(all_res.keys()):
-            r=all_res[mid]; m=r.get("metrics",{})
-            w.writerow([mid,r.get("name",""),m.get("r2",""),m.get("mae",""),
-                        m.get("rmse",""),m.get("mse",""),r.get("elapsed_s","")])
-    try: plot_summary_table(all_res, COMPARISON_DIR)
-    except Exception as _e: log.warning(f"  Summary table: {_e}")
+    headers = ["Model", "Name", "R2", "Adj_R2", "MAE", "RMSE", "MAPE%",
+               "MaxErr", "Epochs", "Time(s)"]
+    rows = []
+    for m_num in sorted(all_results.keys()):
+        met = all_results[m_num]
+        rows.append([
+            f"M{m_num:02d}",
+            C.MODEL_NAMES.get(m_num, ""),
+            f"{met.get('R2', 0):.4f}",
+            f"{met.get('Adj_R2', 0):.4f}",
+            f"{met.get('MAE', 0):.4f}",
+            f"{met.get('RMSE', 0):.4f}",
+            f"{met.get('MAPE', 0):.1f}",
+            f"{met.get('MaxError', 0):.4f}",
+            str(met.get('epochs', 0)),
+            f"{met.get('training_time', 0):.1f}",
+        ])
 
+    csv_path = os.path.join(comp_dir, "comparison_table.csv")
+    with open(csv_path, 'w', newline='') as f:
+        w = csv.writer(f)
+        w.writerow(headers)
+        w.writerows(rows)
+    log.info(f"  Saved {csv_path}")
 
-def run_chemistry_comparison(wns, X_tr, Y_tr, finished):
-    try:
-        from chemistry_report import (batch_chemistry, mean_profile, compare_models,
-                                      format_report, save_chemistry_json, plot_bond_contribution)
-        from utils import preprocess_batch
-    except ImportError as e:
-        log.warning(f"  chemistry_report import error: {e}"); return
+    # ── comparison.png (horizontal bar chart) ───────────────────────────
+    models = sorted(all_results.keys())
+    r2_vals = [all_results[m].get('R2', 0) for m in models]
+    mae_vals = [all_results[m].get('MAE', 0) for m in models]
+    names = [f"M{m:02d}" for m in models]
 
-    X_proc = preprocess_batch(X_tr, "full")
-    profiles = batch_chemistry(X_proc, wns, Y_tr, LABEL_COLS)
-    avg      = mean_profile(profiles)
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, max(6, len(models) * 0.5 + 1)))
 
+    y_pos = np.arange(len(models))
+    colors_r2 = ['#2ecc71' if v > 0.4 else '#f39c12' if v >= 0 else '#e74c3c' for v in r2_vals]
+    ax1.barh(y_pos, r2_vals, color=colors_r2, edgecolor='k', linewidth=0.5)
+    ax1.set_yticks(y_pos)
+    ax1.set_yticklabels(names)
+    ax1.set_xlabel("R²")
+    ax1.set_title("R² (higher = better)")
+    ax1.axvline(0, color='k', linewidth=0.5)
+    for i, v in enumerate(r2_vals):
+        ax1.text(v + 0.01, i, f"{v:.3f}", va='center', fontsize=9)
 
-    # Build per-model profiles
-    model_profiles = {}
-    for mid in [m for m in finished if m >= 6]:
-        # Try to load model-specific chemistry from saved JSON
-        import json as _json
-        from config import get_model_dir as _gmd
-        chem_path = os.path.join(_gmd(mid), f"model{mid:02d}_chemistry.json")
-        if os.path.exists(chem_path):
-            try:
-                with open(chem_path) as _f: _cd = _json.load(_f)
-                _prof_data = _cd.get("profile", {})
-                from chemistry_report import ChemistryProfile, _comment_pH, _comment_polarity
-                from chemistry_report import _comment_hydro, _comment_strength, _comment_arom
-                from chemistry_report import _comment_amide, _comment_cryst
-                _p = ChemistryProfile(**{k:v for k,v in _prof_data.items()
-                                         if k in ChemistryProfile.__dataclass_fields__})
-                _p.comments = {
-                    "pH": _comment_pH(_p.pH_score), "polarity": _comment_polarity(_p.polarity),
-                    "hydrophilicity": _comment_hydro(_p.hydrophilicity),
-                    "bond_strength": _comment_strength(_p.bond_strength),
-                    "aromaticity": _comment_arom(_p.aromaticity),
-                    "amide_ratio": _comment_amide(_p.amide_I_III_ratio),
-                    "crystallinity": _comment_cryst(_p.crystallinity_proxy),
-                }
-                model_profiles[f"M{mid}-{MODEL_NAMES[mid][:10]}"] = _p
-            except Exception as _e:
-                log.warning(f"  Load chemistry M{mid}: {_e}")
-                model_profiles[f"M{mid}-{MODEL_NAMES[mid][:10]}"] = avg
-        else:
-            model_profiles[f"M{mid}-{MODEL_NAMES[mid][:10]}"] = avg
+    colors_mae = ['#2ecc71' if v < 0.1 else '#f39c12' if v < 0.2 else '#e74c3c' for v in mae_vals]
+    ax2.barh(y_pos, mae_vals, color=colors_mae, edgecolor='k', linewidth=0.5)
+    ax2.set_yticks(y_pos)
+    ax2.set_yticklabels(names)
+    ax2.set_xlabel("MAE")
+    ax2.set_title("MAE (lower = better)")
+    for i, v in enumerate(mae_vals):
+        ax2.text(v + 0.002, i, f"{v:.4f}", va='center', fontsize=9)
 
-    if model_profiles:
-        cmp_text = compare_models(model_profiles, save_path=COMPARISON_DIR)
-        print(cmp_text)
+    fig.suptitle("Model Comparison", fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    fig.savefig(os.path.join(comp_dir, "comparison.png"), dpi=C.FIG_DPI, bbox_inches='tight')
+    plt.close(fig)
+    log.info(f"  Saved comparison.png")
 
-    # Per-sample table
-    log.info("\n  Per-sample physicochemical:")
-    print(f"  {'Idx':<5} {'Est.pI':>6} {'pH':>7} {'Polar':>7} {'Hydro':>7} {'Arom':>7} {'Struct':<15} {'Dom.Bond'}")
-    for i, prof in enumerate(profiles):
-        print(f"  {i:<5} {prof.estimated_pI:>6.2f} {prof.pH_score:>+7.3f} "
-              f"{prof.polarity:>7.3f} {prof.hydrophilicity:>7.3f} "
-              f"{prof.aromaticity:>7.4f} {prof.secondary_structure[:14]:<15} {prof.dominant_bond}")
+    # ── models_summary_table.png ────────────────────────────────────────
+    fig, ax = plt.subplots(figsize=(16, max(4, len(models) * 0.45 + 2)))
+    ax.axis('off')
 
-    # Save
-    from dataclasses import asdict; import json
-    out = {"avg_profile": asdict(avg),
-           "per_sample": [{
-               "idx": i, "estimated_pI": p.estimated_pI, "pH_score": p.pH_score,
-               "polarity": p.polarity, "hydrophilicity": p.hydrophilicity,
-               "bond_strength": p.bond_strength, "aromaticity": p.aromaticity,
-               "amide_I_III_ratio": p.amide_I_III_ratio,
-               "secondary_structure": p.secondary_structure,
-               "aliphatic_index": p.aliphatic_index,
-               "carboxylate_ratio": p.carboxylate_ratio,
-               "amine_ratio": p.amine_ratio,
-               "crystallinity_proxy": p.crystallinity_proxy,
-               "spectral_entropy": p.spectral_entropy,
-               "dominant_bond": p.dominant_bond,
-               "top3_bonds": p.top3_bonds,
-           } for i, p in enumerate(profiles)]}
-    path = os.path.join(COMPARISON_DIR, "chemistry_all_models.json")
-    with open(path,"w") as f:
-        json.dump(out, f, indent=2,
-                  default=lambda x: float(x) if hasattr(x,"__float__") else str(x))
+    cell_text = []
+    best_r2_idx = np.argmax(r2_vals)
+    for i, row in enumerate(rows):
+        cell_text.append(row)
 
-    # Comparison plot
-    try:
-        plot_bond_contribution(avg, "Train average",
-                               os.path.join(COMPARISON_DIR, "chemistry_bond_contribution.png"))
-        log.info(f"  Da luu chemistry files vao {COMPARISON_DIR}")
-    except Exception as e:
-        log.warning(f"  Chemistry plot loi: {e}")
+    table = ax.table(cellText=cell_text, colLabels=headers, loc='center',
+                     cellLoc='center')
+    table.auto_set_font_size(False)
+    table.set_fontsize(8)
+    table.scale(1, 1.4)
 
+    # Header styling
+    for j in range(len(headers)):
+        table[0, j].set_facecolor('#2c3e50')
+        table[0, j].set_text_props(color='white', fontweight='bold')
 
-def compare_only():
-    all_res = {}
-    for mid in range(1,11):
-        r = load_results(mid)
-        if r:
-            r["name"] = r.get("name", MODEL_NAMES.get(mid, f"M{mid}"))
-            all_res[mid] = r
-    if not all_res:
-        log.warning("Chua co ket qua."); return
-    _print_table(all_res); plot_comparison(all_res)
+    # Highlight best R²
+    if len(rows) > 0:
+        for j in range(len(headers)):
+            table[best_r2_idx + 1, j].set_facecolor('#d5f5e3')
+
+    ax.set_title("All Models — Summary", fontsize=14, fontweight='bold', pad=20)
+    plt.tight_layout()
+    fig.savefig(os.path.join(comp_dir, "models_summary_table.png"),
+                dpi=C.FIG_DPI, bbox_inches='tight')
+    plt.close(fig)
+    log.info(f"  Saved models_summary_table.png")
+
+    # ── all_models_summary.json ─────────────────────────────────────────
+    summary = {}
+    for m_num in sorted(all_results.keys()):
+        met = all_results[m_num]
+        summary[f"M{m_num:02d}"] = {
+            "name": C.MODEL_NAMES.get(m_num, ""),
+            "R2": met.get('R2', 0),
+            "Adj_R2": met.get('Adj_R2', 0),
+            "MAE": met.get('MAE', 0),
+            "RMSE": met.get('RMSE', 0),
+            "MAPE": met.get('MAPE', 0),
+            "MaxError": met.get('MaxError', 0),
+            "epochs": met.get('epochs', 0),
+            "training_time": met.get('training_time', 0),
+            "per_aa": met.get('per_aa', {}),
+        }
+    json_path = os.path.join(comp_dir, "all_models_summary.json")
+    with open(json_path, 'w') as f:
+        json.dump(summary, f, indent=2, default=str)
+    log.info(f"  Saved {json_path}")
+
+    # ── chemistry_comparison.png (M6–M10) ──────────────────────────────
+    chem_data = {}
+    for m_num in sorted(all_results.keys()):
+        if m_num >= 6:
+            # Try loading from chemistry.json files
+            chem_path = os.path.join(C.RESULTS_DIR, f"model{m_num:02d}",
+                                      f"model{m_num:02d}_chemistry.json")
+            if os.path.exists(chem_path):
+                with open(chem_path) as f:
+                    cdata = json.load(f)
+                chem_data[m_num] = cdata.get("average", {})
+            elif 'chemistry' in all_results[m_num]:
+                chem_data[m_num] = all_results[m_num]['chemistry']
+
+    if chem_data:
+        from chemistry_report import compare_models_table
+        compare_models_table(chem_data, comp_dir)
+
+    log.info("  Comparison generation complete.")
 
 
 def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--data",           default=DATA_FILE)
-    p.add_argument("--models",         default="1,2,3,4,5,6,7,8,9,10")
-    p.add_argument("--retrain",        action="store_true")
-    p.add_argument("--compare-only",   action="store_true")
-    p.add_argument("--chemistry-only", action="store_true")
-    p.add_argument("--train-n",        type=int, default=48)
-    p.add_argument("--seed",           type=int, default=42)
-    args = p.parse_args()
+    parser = argparse.ArgumentParser(description="Run Raman AA models")
+    parser.add_argument("--data", type=str, default=C.DATA_PATH)
+    parser.add_argument("--models", type=str, default=None,
+                        help="Comma-separated model numbers (e.g., 1,4,7)")
+    parser.add_argument("--retrain", action="store_true")
+    parser.add_argument("--compare-only", action="store_true")
+    args = parser.parse_args()
+
+    set_seeds()
+
+    # Create directories
+    for d in [C.RESULTS_DIR, C.CHECKPOINTS_DIR, C.PREDICTIONS_DIR, C.ANALYSIS_DIR]:
+        os.makedirs(d, exist_ok=True)
+
+    # Generate bond region report
+    log.info("Generating bond region report...")
+    from bond_region_report import generate_report
+    generate_report(os.path.join(C.ANALYSIS_DIR, "bond_region_report.txt"))
+
+    # Determine which models to run
+    if args.models:
+        model_nums = [int(x.strip()) for x in args.models.split(",")]
+    else:
+        model_nums = list(range(1, 11))
 
     if args.compare_only:
-        compare_only(); return
-
-    try:
-        model_ids = [int(x.strip()) for x in args.models.split(",")]
-    except ValueError:
-        log.error("--models phai la so, vi du: 1,3,5"); sys.exit(1)
-
-    if not os.path.exists(args.data):
-        log.error(f"Khong tim thay: {args.data}"); sys.exit(1)
-
-    log.info(f"Dang tai du lieu: {args.data}")
-    X, Y, sids, wns = load_data(args.data, convert_wavelength=True)
-
-    log.info("\nAggregate spectra theo sample...")
-    X_agg, Y_agg, sid_agg = aggregate_by_sample(X, Y, sids, method="median")
-
-    log.info(f"\nSplit: train_n={args.train_n}, seed={args.seed}")
-    X_tr,X_te,Y_tr,Y_te,tr_set,te_set = split_data(
-        X_agg, Y_agg, sid_agg, train_n=args.train_n, seed=args.seed)
-    log.info(f"Train samples: {sorted(tr_set)}")
-    log.info(f"Test  samples: {sorted(te_set)}")
-
-    te_mask    = np.array([s in te_set for s in sids])
-    X_te_raw   = X[te_mask]; Y_te_raw = Y[te_mask]; sid_te_raw = sids[te_mask]
-    log.info(f"Raw test spectra: {X_te_raw.shape[0]} (6 samples x ~90 pho)")
-    log.info(f"Raman shift: {wns.min():.1f}-{wns.max():.1f} cm-1\n")
-
-    if args.chemistry_only:
-        finished = [mid for mid in range(1,11) if load_results(mid) is not None]
-        run_chemistry_comparison(wns, X_tr, Y_tr, finished)
+        # Load existing results
+        all_results = {}
+        for m in range(1, 11):
+            rpath = os.path.join(C.RESULTS_DIR, f"model{m:02d}", f"model{m:02d}_results.json")
+            if os.path.exists(rpath):
+                with open(rpath) as f:
+                    all_results[m] = json.load(f)
+        if all_results:
+            generate_comparison(all_results)
+        else:
+            log.warning("No results found for comparison.")
         return
 
-    all_res = {}; finished = []
-    for mid in range(1,11):
-        r = load_results(mid)
-        if r:
-            r["name"] = r.get("name", MODEL_NAMES.get(mid, f"M{mid}"))
-            all_res[mid] = r
+    # Load and split data
+    log.info("=" * 60)
+    log.info("RAMAN AMINO ACID MIXTURE ANALYSIS")
+    log.info("=" * 60)
+    X, Y, wavenumbers, sample_ids = load_data(args.data)
+    Xtr, Xv, Xt, Ytr, Yv, Yt, sid_tr, sid_v, sid_t = split_data(X, Y, sample_ids)
 
-    t_total = time.time()
-    for mid in model_ids:
-        if INTERRUPTER.stop_requested:
-            log.info("Runner dung theo yeu cau"); break
-        res = run_model(mid, X_tr, X_te, Y_tr, Y_te, wns, args.retrain,
-                        X_te_raw, Y_te_raw, sid_te_raw)
-        if res:
-            all_res[mid] = res; finished.append(mid)
-            print(f"\n  Model {mid} ({MODEL_NAMES[mid]})")
-            print_metrics(res["metrics"], indent=4)
+    kw = {"sid_train": sid_tr, "sid_val": sid_v, "sid_test": sid_t}
 
-    log.info(f"\nTong thoi gian: {time.time()-t_total:.1f}s")
-    if all_res:
-        _print_table(all_res)
-        try: plot_comparison(all_res)
-        except Exception as e: log.warning(f"Comparison plot loi: {e}")
-        master = {mid: {"name":v.get("name",""), "metrics":v.get("metrics",{}),
-                        "elapsed_s":v.get("elapsed_s",0)} for mid,v in all_res.items()}
-        with open(os.path.join(COMPARISON_DIR,"all_models_summary.json"),"w") as f:
-            json.dump(master, f, indent=2,
-                      default=lambda x: float(x) if isinstance(x,(float,int)) else str(x))
+    all_results = {}
+    for m_num in model_nums:
+        log.info("=" * 60)
+        log.info(f"MODEL {m_num:02d}: {C.MODEL_NAMES.get(m_num, '')}")
+        log.info("=" * 60)
+        try:
+            Y_pred, metrics = run_model(m_num, Xtr, Xv, Xt, Ytr, Yv, Yt,
+                                        wavenumbers, args.retrain, kw)
+            all_results[m_num] = metrics
 
-    chem_done = [m for m in finished if m >= 6]
-    if chem_done:
-        try: run_chemistry_comparison(wns, X_tr, Y_tr, chem_done)
+            # Save predictions
+            pred_path = os.path.join(C.PREDICTIONS_DIR, f"model{m_num:02d}_predictions.npy")
+            np.save(pred_path, Y_pred)
+
+        except MemoryError:
+            log.error(f"  MemoryError in model {m_num:02d} — skipping")
+            gc.collect()
+        except KeyboardInterrupt:
+            log.warning(f"  KeyboardInterrupt at model {m_num:02d} — saving and continuing")
+            gc.collect()
         except Exception as e:
-            log.error(f"Chemistry loi: {e}"); log.error(traceback.format_exc())
+            log.error(f"  Error in model {m_num:02d}: {e}")
+            traceback.print_exc()
+            gc.collect()
 
-    log.info("Hoan tat!")
+    # Also load any previously saved results for models we didn't run
+    for m in range(1, 11):
+        if m not in all_results:
+            rpath = os.path.join(C.RESULTS_DIR, f"model{m:02d}", f"model{m:02d}_results.json")
+            if os.path.exists(rpath):
+                with open(rpath) as f:
+                    all_results[m] = json.load(f)
+
+    # Generate comparison
+    if all_results:
+        log.info("=" * 60)
+        log.info("GENERATING COMPARISON")
+        log.info("=" * 60)
+        generate_comparison(all_results)
+
+    log.info("=" * 60)
+    log.info("ALL DONE")
+    log.info("=" * 60)
 
 
 if __name__ == "__main__":
-    try: main()
-    except SystemExit: raise
-    except KeyboardInterrupt: print("\n[!] Dung."); sys.exit(0)
-    except Exception as e:
-        log.error(f"Loi: {e}"); log.error(traceback.format_exc()); sys.exit(1)
+    main()

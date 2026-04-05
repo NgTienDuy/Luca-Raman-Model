@@ -1,0 +1,127 @@
+================================================================================
+BOND REGION REPORT — Raman Amino Acid Spectral Analysis
+================================================================================
+
+1. THE 17 BOND TYPES
+----------------------------------------
+  # 1: C-C (aliphatic)                   800–1100   cm⁻¹  Present in: All 6
+  # 2: C=C (aromatic)                   1500–1600   cm⁻¹  Present in: Histidine
+  # 3: C-H (sp3)                        1350–1500   cm⁻¹  Present in: All 6  [Overtone/deformation of 2800-3000]
+  # 4: C-H (sp2)                        1000–1100   cm⁻¹  Present in: Histidine  [Overtone of 3000-3100]
+  # 5: C-N (amine)                      1000–1150   cm⁻¹  Present in: All 6
+  # 6: C-N (amide)                      1100–1250   cm⁻¹  Present in: Asparagine
+  # 7: C=N (imine/aromatic)             1550–1650   cm⁻¹  Present in: Histidine
+  # 8: C=O (carboxyl)                   1680–1750   cm⁻¹  Present in: All 6
+  # 9: C=O (amide)                      1630–1690   cm⁻¹  Present in: Asparagine
+  #10: C-O (carboxyl)                   1200–1350   cm⁻¹  Present in: All 6
+  #11: C-O (alcohol)                    1000–1100   cm⁻¹  Present in: Glucosamine
+  #12: C-O (ether)                      1070–1150   cm⁻¹  Present in: Glucosamine
+  #13: N-H (primary amine)              1550–1650   cm⁻¹  Present in: All 6  [Bending mode; stretch 3300-3500 outside range]
+  #14: N-H (primary amide)              1600–1680   cm⁻¹  Present in: Asparagine
+  #15: N-H (secondary aromatic)         1550–1630   cm⁻¹  Present in: Histidine  [Overtone/combination of 3100-3250]
+  #16: O-H (carboxylic)                 1300–1450   cm⁻¹  Present in: All 6  [Bending/combination of broad 2500-3300]
+  #17: O-H (alcoholic)                  1200–1400   cm⁻¹  Present in: Glucosamine  [Bending mode of 3200-3600]
+
+2. AMINO ACID ↔ BOND TYPE MAPPING
+----------------------------------------
+  Alanine: #1 C-C (aliphatic), #3 C-H (sp3), #5 C-N (amine), #8 C=O (carboxyl), #10 C-O (carboxyl), #13 N-H (primary amine), #16 O-H (carboxylic)
+  Asparagine: #1 C-C (aliphatic), #3 C-H (sp3), #5 C-N (amine), #6 C-N (amide), #8 C=O (carboxyl), #9 C=O (amide), #10 C-O (carboxyl), #13 N-H (primary amine), #14 N-H (primary amide), #16 O-H (carboxylic)
+  Aspartic Acid: #1 C-C (aliphatic), #3 C-H (sp3), #5 C-N (amine), #8 C=O (carboxyl), #10 C-O (carboxyl), #13 N-H (primary amine), #16 O-H (carboxylic)
+  Glucosamine: #1 C-C (aliphatic), #3 C-H (sp3), #5 C-N (amine), #8 C=O (carboxyl), #10 C-O (carboxyl), #11 C-O (alcohol), #12 C-O (ether), #13 N-H (primary amine), #16 O-H (carboxylic), #17 O-H (alcoholic)
+  Glutamic Acid: #1 C-C (aliphatic), #3 C-H (sp3), #5 C-N (amine), #8 C=O (carboxyl), #10 C-O (carboxyl), #13 N-H (primary amine), #16 O-H (carboxylic)
+  Histidine: #1 C-C (aliphatic), #2 C=C (aromatic), #3 C-H (sp3), #4 C-H (sp2), #5 C-N (amine), #7 C=N (imine/aromatic), #8 C=O (carboxyl), #10 C-O (carboxyl), #13 N-H (primary amine), #15 N-H (secondary aromatic), #16 O-H (carboxylic)
+
+3. SPECTRAL REGION DEFINITIONS (267–2004 cm⁻¹)
+----------------------------------------
+      267–500     cm⁻¹: Low-frequency lattice/skeletal
+    Bond types: none
+    Polarity: low, Strength: weak
+    Lattice modes, skeletal deformations, torsions. No specific bond type from the 17.
+
+      500–800     cm⁻¹: Skeletal C-C/C-N stretch (low)
+    Bond types: none
+    Polarity: moderate, Strength: moderate
+    C-C and C-N skeletal stretches, ring breathing (low end). Transitional region.
+
+      800–1100    cm⁻¹: C-C aliphatic + C-N amine + C-O alcohol/ether + C-H sp2 overtone
+    Bond types: #1, #4, #5, #11, #12
+    Polarity: moderate, Strength: moderate-strong
+    Major region: C-C(sp3) stretch #1, C-N(amine) #5, C-O(alcohol) #11, C-O(ether) #12, C-H(sp2) overtone #4. Ring breathing modes.
+
+     1100–1200    cm⁻¹: C-N amide stretch
+    Bond types: #6
+    Polarity: moderate-high, Strength: moderate
+    C-N(amide) stretch #6 from asparagine side chain.
+
+     1200–1350    cm⁻¹: C-O carboxyl + O-H bending
+    Bond types: #10, #17
+    Polarity: high, Strength: moderate-strong
+    C-O(carboxyl) single bond #10. O-H(alcoholic) bending #17.
+
+     1350–1500    cm⁻¹: C-H sp3 deformation + O-H carboxylic bending
+    Bond types: #3, #16
+    Polarity: moderate, Strength: moderate
+    C-H(sp3) bending/deformation #3. O-H(carboxylic) bending #16.
+
+     1500–1630    cm⁻¹: C=C aromatic + C=N + N-H bends
+    Bond types: #2, #7, #13, #15
+    Polarity: high, Strength: strong
+    C=C(aromatic) #2, C=N(imine) #7, N-H(amine) bend #13, N-H(secondary aromatic) #15.
+
+     1630–1700    cm⁻¹: Amide I/II + N-H amide bend
+    Bond types: #9, #14
+    Polarity: high, Strength: strong
+    C=O(amide) #9, N-H(primary amide) bend #14. Amide I region.
+
+     1700–1800    cm⁻¹: C=O carboxyl stretch
+    Bond types: #8
+    Polarity: high, Strength: strong
+    C=O(carboxyl) stretch #8 from -COOH.
+
+     1800–2004    cm⁻¹: High-frequency overtone/combination
+    Bond types: none
+    Polarity: low, Strength: weak
+    Overtone and combination bands. No primary fundamentals from 17 types in this window.
+
+4. MEASUREMENT RANGE COVERAGE ANALYSIS
+----------------------------------------
+  Our measurement range: 267–2004 cm⁻¹
+
+  Fully within range (17 bonds):
+    #1: C-C (aliphatic) (800–1100 cm⁻¹)
+    #2: C=C (aromatic) (1500–1600 cm⁻¹)
+    #3: C-H (sp3) (1350–1500 cm⁻¹)
+    #4: C-H (sp2) (1000–1100 cm⁻¹)
+    #5: C-N (amine) (1000–1150 cm⁻¹)
+    #6: C-N (amide) (1100–1250 cm⁻¹)
+    #7: C=N (imine/aromatic) (1550–1650 cm⁻¹)
+    #8: C=O (carboxyl) (1680–1750 cm⁻¹)
+    #9: C=O (amide) (1630–1690 cm⁻¹)
+    #10: C-O (carboxyl) (1200–1350 cm⁻¹)
+    #11: C-O (alcohol) (1000–1100 cm⁻¹)
+    #12: C-O (ether) (1070–1150 cm⁻¹)
+    #13: N-H (primary amine) (1550–1650 cm⁻¹)
+    #14: N-H (primary amide) (1600–1680 cm⁻¹)
+    #15: N-H (secondary aromatic) (1550–1630 cm⁻¹)
+    #16: O-H (carboxylic) (1300–1450 cm⁻¹)
+    #17: O-H (alcoholic) (1200–1400 cm⁻¹)
+
+  Outside range — visible via overtones/combinations (0 bonds):
+
+  Partially in range (0 bonds):
+
+5. LITERATURE VALIDATION
+----------------------------------------
+  Region definitions validated against published Raman spectroscopy references:
+  - C-C aliphatic stretches: 800-1100 cm⁻¹ (Socrates, 2004)
+  - C-N stretches: 1000-1250 cm⁻¹ (Lin-Vien et al., 1991)
+  - C-H deformations: 1350-1500 cm⁻¹ (Colthup et al., 1990)
+  - Amide I band: 1630-1700 cm⁻¹ (Barth, 2007)
+  - C=O carboxyl: 1700-1750 cm⁻¹ (Socrates, 2004)
+  - Imidazole ring (His): 1500-1600 cm⁻¹ (Takeuchi, 2003)
+
+  Note: X-H stretching fundamentals (N-H, O-H, C-H above 2500 cm⁻¹)
+  are outside our measurement range. They are represented by their
+  overtones, combination bands, and bending modes within 267-2004 cm⁻¹.
+
+================================================================================

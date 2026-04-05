@@ -1,51 +1,78 @@
-"""model01.py — Softmax Regression"""
-import numpy as np, time, os
-from sklearn.linear_model import Ridge
-from sklearn.preprocessing import StandardScaler
+"""
+Model 01: Ridge Regression with Softmax Output — Linear baseline.
+Train on sample-level medians. Predict on individual test spectra.
+"""
+import os, time, logging, gc
+import numpy as np
 from scipy.special import softmax
-from utils import (preprocess_batch, evaluate, print_metrics, save_checkpoint,
-                   load_checkpoint, save_results, plot_predictions,
-                   plot_predictions_raw, plot_r2_curve, get_logger)
-from config import MODEL_CONFIGS, LABEL_COLS
-log=get_logger("model01"); CFG=MODEL_CONFIGS[1]
+from sklearn.linear_model import Ridge
+from sklearn.metrics import r2_score
 
-def run(X_train,X_test,Y_train,Y_test,retrain=False,
-        X_test_raw=None,Y_test_raw=None,sid_test_raw=None,**kw):
-    log.info("="*60); log.info("Model 1 — Softmax Regression")
-    log.info(f"  N_train={len(X_train)}, N_test={len(X_test)}"); log.info("="*60)
-    t0=time.time()
-    if not retrain:
-        ck=load_checkpoint(1)
-        if ck:
-            log.info("  Tải checkpoint")
-            sc,W=ck["sc"],ck["W"]
-            Xte=sc.transform(preprocess_batch(X_test,"full"))
-            Yp=softmax(Xte@W,axis=1); m=evaluate(Y_test,Yp,LABEL_COLS)
-            print_metrics(m,"M1 Test(ck)",2); return Yp,m
-    Xtr=preprocess_batch(X_train,"full"); Xte=preprocess_batch(X_test,"full")
-    sc=StandardScaler(); Xtr=sc.fit_transform(Xtr); Xte=sc.transform(Xte)
-    eps=1e-6; Ylog=np.log(np.clip(Y_train,eps,1.)); Ylog-=Ylog.mean(axis=1,keepdims=True)
-    # Sweep alpha to get R² curve
-    alphas=[10,50,100,500,1000,5000,CFG["alpha"],50000]
-    r2_vals=[]
-    for a in alphas:
-        ridge=Ridge(alpha=a,solver=CFG["solver"],max_iter=CFG["max_iter"])
-        ridge.fit(Xtr,Ylog)
-        Yp_a=softmax(Xte@ridge.coef_.T,axis=1)
-        r2_vals.append(evaluate(Y_test,Yp_a,LABEL_COLS)["r2"])
-    plot_r2_curve(r2_vals,1,"Softmax Regression (alpha sweep)")
-    ridge=Ridge(alpha=CFG["alpha"],solver=CFG["solver"],max_iter=CFG["max_iter"])
-    ridge.fit(Xtr,Ylog); W=ridge.coef_.T
-    Yp_tr=softmax(Xtr@W,axis=1); Yp_te=softmax(Xte@W,axis=1)
-    mtr=evaluate(Y_train,Yp_tr,LABEL_COLS); mte=evaluate(Y_test,Yp_te,LABEL_COLS)
-    log.info(f"  Time: {time.time()-t0:.1f}s")
-    print_metrics(mtr,"M1 Train",2); print_metrics(mte,"M1 Test",2)
-    save_checkpoint(1,{"W":W,"sc":sc})
-    save_results(1,mte,{"Y_pred":Yp_te,"Y_true":Y_test},
-                 {"name":"Softmax Regression","elapsed_s":time.time()-t0,"train_metrics":mtr})
-    plot_predictions(Y_test,Yp_te,1,"Softmax Regression",LABEL_COLS)
-    if X_test_raw is not None:
-        Xte_r=sc.transform(preprocess_batch(X_test_raw,"full"))
-        Yp_r=softmax(Xte_r@W,axis=1)
-        plot_predictions_raw(Y_test_raw,Yp_r,sid_test_raw,1,"Softmax Regression",LABEL_COLS)
-    return Yp_te,mte
+import config as C
+from utils import (preprocess_batch, compute_metrics, aggregate_by_sample,
+                   plot_scatter_aggregated, plot_scatter_raw,
+                   plot_sweep, save_results, set_seeds)
+
+log = logging.getLogger(__name__)
+MODEL_NUM = 1
+
+
+def run(X_train, X_val, X_test, Y_train, Y_val, Y_test,
+        wavenumbers=None, retrain=False, **kw):
+    set_seeds()
+    t0 = time.time()
+    save_dir = os.path.join(C.RESULTS_DIR, f"model{MODEL_NUM:02d}")
+    os.makedirs(save_dir, exist_ok=True)
+
+    sid_train = kw.get("sid_train")
+    sid_val = kw.get("sid_val")
+    sid_test = kw.get("sid_test")
+
+    # Aggregate to sample medians for training
+    Xtr_m, Ytr_m, _ = aggregate_by_sample(X_train, Y_train, sid_train)
+    Xva_m, Yva_m, _ = aggregate_by_sample(X_val, Y_val, sid_val)
+
+    Xtr_m = preprocess_batch(Xtr_m, 'snv')
+    Xva_m = preprocess_batch(Xva_m, 'snv')
+
+    # Log-transform targets and mean-center
+    Ytr_log = np.log(np.clip(Ytr_m, 1e-6, None))
+    Ytr_log -= Ytr_log.mean(axis=1, keepdims=True)
+
+    # Sweep alpha
+    log.info("M01: Sweeping alphas...")
+    alphas = C.RIDGE_ALPHAS
+    sweep_scores = []
+    best_r2 = -1e9
+    best_model = None
+    best_alpha = None
+
+    for alpha in alphas:
+        model = Ridge(alpha=alpha, solver="lsqr").fit(Xtr_m, Ytr_log)
+        pred = softmax(model.predict(Xva_m), axis=1)
+        r2 = r2_score(Yva_m, pred, multioutput="uniform_average")
+        sweep_scores.append(r2)
+        log.info(f"  alpha={alpha:>8} -> val R²={r2:.4f}")
+        if r2 > best_r2:
+            best_r2, best_model, best_alpha = r2, model, alpha
+
+    log.info(f"M01: Best alpha={best_alpha}, val R²={best_r2:.4f}")
+    plot_sweep(alphas, sweep_scores, "Alpha (Ridge)", MODEL_NUM, save_dir)
+
+    # Predict on ALL individual test spectra
+    Xt_proc = preprocess_batch(X_test, 'snv')
+    Y_pred = softmax(best_model.predict(Xt_proc), axis=1)
+
+    metrics = compute_metrics(Y_test, Y_pred)
+    metrics["best_alpha"] = best_alpha
+    metrics["epochs"] = len(alphas)
+    metrics["training_time"] = time.time() - t0
+
+    log.info(f"M01: Test R²={metrics['R2']:.4f}, MAE={metrics['MAE']:.4f}")
+
+    plot_scatter_aggregated(Y_test, Y_pred, sid_test, MODEL_NUM, save_dir)
+    plot_scatter_raw(Y_test, Y_pred, sid_test, MODEL_NUM, save_dir)
+    save_results(metrics, MODEL_NUM, save_dir)
+
+    gc.collect()
+    return Y_pred, metrics

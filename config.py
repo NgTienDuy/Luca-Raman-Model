@@ -1,59 +1,109 @@
-"""config.py — Cấu hình toàn dự án"""
+"""
+Configuration for Raman Amino Acid project.
+All hyperparameters, paths, and constants in one place.
+"""
 import os
 
-BASE_DIR        = os.path.dirname(os.path.abspath(__file__))
-RESULTS_DIR     = os.path.join(BASE_DIR, "results")
-CHECKPOINT_DIR  = os.path.join(BASE_DIR, "checkpoints")
-PREDICTIONS_DIR = os.path.join(BASE_DIR, "predictions")
-ANALYSIS_DIR    = os.path.join(BASE_DIR, "analysis")
-COMPARISON_DIR  = os.path.join(RESULTS_DIR, "comparison")
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
-def get_model_dir(model_id: int) -> str:
-    """Trả về thư mục kết quả của từng model"""
-    d = os.path.join(RESULTS_DIR, f"model{model_id:02d}")
-    os.makedirs(d, exist_ok=True)
-    return d
+# ── Paths ───────────────────────────────────────────────────────────────
+DATA_PATH = "data.csv"
+RESULTS_DIR = "results"
+CHECKPOINTS_DIR = "checkpoints"
+PREDICTIONS_DIR = "predictions"
+ANALYSIS_DIR = "analysis"
 
-for d in [RESULTS_DIR, CHECKPOINT_DIR, PREDICTIONS_DIR, ANALYSIS_DIR, COMPARISON_DIR]:
-    os.makedirs(d, exist_ok=True)
+# ── Laser / Conversion ─────────────────────────────────────────────────
+LASER_WL_NM = 784.815734863281  # excitation wavelength
 
-DATA_FILE   = "data.csv"
-LABEL_COLS  = ["Alanine","Asparagine","Aspartic Acid",
-               "Glutamic Acid","Histidine","Glucosamine"]
-SAMPLE_COL  = "vial #"
-N_OUTPUTS   = 6
-LASER_NM    = 784.815734863281
+# ── Amino acid labels (column order) ───────────────────────────────────
+AA_NAMES = ["Alanine", "Asparagine", "Aspartic Acid",
+            "Glutamic Acid", "Histidine", "Glucosamine"]
+NUM_AA = 6
 
-TRAIN_SAMPLES       = 48
-SPLIT_SEED          = 2026
-SAVE_EVERY_N_EPOCHS = 10
+# ── Data split ──────────────────────────────────────────────────────────
+SEED = 42
+VAL_SIZE = 6   # samples
+TEST_SIZE = 6  # samples
 
-MODEL_CONFIGS = {
-    1:  {"alpha":100,"solver":"lsqr","max_iter":5000},
-    2:  {"n_components":40,"alpha":0.1,"pca_variance":0.99},
-    3:  {"n_components_nmf":8,"n_lv_plsr":20,"max_iter_nmf":3000,"n_bond_regions":8},
-    4:  {"hidden_sizes":[256,128,64],"dropout":0.5,"lr":5e-4,"weight_decay":1e-3,
-         "batch_size":16,"max_epochs":500,"patience":50,"n_aug":10,"noise_std":0.02},
-    5:  {"channels":[32,64,128],"kernels":[15,9,5],"dropout":0.5,"lr":5e-4,
-         "weight_decay":1e-3,"batch_size":16,"max_epochs":500,"patience":50,"n_aug":8},
-    6:  {"n_estimators":600,"learning_rate":0.03,"max_depth":4,
-         "early_stopping_rounds":30,"subsample":0.8,"colsample_bytree":0.8,
-         "lambda":5.0,"alpha":2.0},
-    7:  {"channels":[32,64,128],"kernels":[15,9,5],"dropout":0.5,"entropy_lambda":5e-4,
-         "lr":5e-4,"weight_decay":1e-3,"batch_size":16,"max_epochs":500,"patience":50,"n_aug":8},
-    8:  {"n_filters":32,"n_bond_regions":13,"recon_weight":0.05,"chem_weight":0.01,
-         "lr":5e-4,"weight_decay":1e-3,"batch_size":16,"max_epochs":400,"patience":50,"n_aug":8},
-    9:  {"n_tools":8,"max_steps":4,"gru_hidden":64,"policy_weight":0.05,"recon_weight":0.05,
-         "lr":5e-4,"weight_decay":1e-3,"batch_size":16,"max_epochs":300,"patience":50,"n_aug":6},
-    10: {"latent_dim":64,"n_fft_components":64,"n_nmf_components":8,"recon_weight":0.03,
-         "diversity_weight":0.01,"lr":5e-4,"weight_decay":1e-3,"batch_size":16,
-         "max_epochs":400,"patience":50,"n_aug":8},
-}
+# ── Preprocessing ───────────────────────────────────────────────────────
+COSMIC_THR = 5.0
+SNIP_ITER = 20
+ALS_LAM = 1e5
+ALS_P = 0.01
+SG_WINDOW = 9
+SG_POLY = 2
 
+# ── Training (deep models) ─────────────────────────────────────────────
+MAX_EPOCHS = 40
+PATIENCE = 10
+BATCH_SIZE = 128
+LR = 1e-3
+WEIGHT_DECAY = 1e-4
+DROPOUT = 0.3
+
+# ── Augmentation limits (memory-safe) ──────────────────────────────────
+N_GAUSSIAN = 2
+N_MIXUP = 2
+NOISE_STD = 0.02
+
+# ── Model-specific ─────────────────────────────────────────────────────
+# M1
+RIDGE_ALPHAS = [1e-3, 1e-2, 0.1, 0.5, 1, 5, 10, 50, 100, 500, 1000]
+ELASTICNET_L1 = [0.1, 0.5, 0.9]
+
+# M2
+NMF_K = 8
+PLSR_LV_RANGE = list(range(2, 16))
+
+# M3
+MLP_CORRECTION_HIDDEN = [64, 32]
+
+# M4
+MLP_LAYERS = [1024, 256, 128, 64]
+
+# M5
+RESNET_CHANNELS = [32, 32, 64]
+
+# M6
+PREPROC_VARIANTS = ['none', 'snv', 'full', 'sg_snv']
+LAMBDA_RECON = 0.01
+LAMBDA_SMOOTH = 0.001
+
+# M7
+LAMBDA_POS = 0.01
+LAMBDA_INT = 0.01
+LAMBDA_BOND = 0.01
+LAMBDA_ATTN = 0.001
+
+# M8
+LAMBDA_CHEM = 0.01
+
+# M9
+HP_TRIALS = 6
+HP_EPOCHS = 15
+PRUNE_SPARSITY = 0.2
+
+# M10
+RIER_Z_DIM = 32
+RIER_PCA_DIM = 30
+RIER_FFT_DIM = 32
+RIER_NMF_K = 8
+
+# ── Plotting ────────────────────────────────────────────────────────────
+FIG_DPI = 150
+SCATTER_COLORS = ['#e6194b', '#3cb44b', '#4363d8', '#f58231', '#911eb4', '#42d4f4']
+
+# ── Model names ─────────────────────────────────────────────────────────
 MODEL_NAMES = {
-    1:"Softmax Regression", 2:"PCA + Ridge Regression",
-    3:"MCR-ALS (NMF) + PLSR", 4:"ANN (MLP)", 5:"1D CNN",
-    6:"Spectral Bond + XGBoost", 7:"CNN + Bond-Region Attention",
-    8:"Neural Module Network", 9:"RL Pipeline Discovery",
-    10:"Radial Information Expansion",
+    1: "Ridge/ElasticNet + Softmax",
+    2: "MCR-ALS (NMF) + PLSR",
+    3: "Two-Stage Hybrid (NNLS + MLP)",
+    4: "MLP (Multi-Layer Perceptron)",
+    5: "1D ResNet",
+    6: "Adaptive Preprocessing Optimizer",
+    7: "Spectral Feature Extraction Optimizer",
+    8: "Regularization & Multi-task Optimizer",
+    9: "Hyperparameter & Loss Function Optimizer",
+    10: "Radial Exhaustive Information Explorer",
 }

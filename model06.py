@@ -1,106 +1,195 @@
-"""model06.py — Spectral Bond Analysis + XGBoost"""
-import numpy as np, time, os
-from utils import (preprocess_batch, evaluate, print_metrics, save_checkpoint,
-                   load_checkpoint, save_results, plot_predictions,
-                   plot_predictions_raw, plot_r2_curve, plot_bond_detect_batch,
-                   get_logger, dirichlet_normalize)
-from spectral_knowledge import get_active_regions, extract_bond_features, extract_derivative_features
-from config import MODEL_CONFIGS, LABEL_COLS, get_model_dir
-log=get_logger("model06"); CFG=MODEL_CONFIGS[6]
+"""
+Model 06: Adaptive Preprocessing Optimizer.
+Gate network selects optimal preprocessing per-spectrum.
+Multi-task loss: L_KL + λ_recon·MSE + λ_smooth·TV
+"""
+import os, time, logging, gc
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset
 
-def _feats(X, wns):
-    regions=get_active_regions(wns)
-    bf=np.array([extract_bond_features(s,wns,regions) for s in X])
-    df=np.array([extract_derivative_features(s,wns,n_seg=8) for s in X])
-    return np.hstack([bf,df]).astype(np.float32), regions
+import config as C
+from utils import (preprocess_batch, compute_metrics, softmax_normalize, plot_scatter_aggregated, plot_scatter_raw,
+                   plot_loss_curve, save_results, set_seeds)
+from model_helpers import post_process_advanced_model
 
-def run(X_train,X_test,Y_train,Y_test,wavenumbers=None,retrain=False,
-        X_test_raw=None,Y_test_raw=None,sid_test_raw=None,**kw):
-    log.info("="*60); log.info("Model 6 — Bond + XGBoost")
-    log.info(f"  N_train={len(X_train)}, N_test={len(X_test)}"); log.info("="*60)
-    t0=time.time()
-    try: import xgboost as xgb
-    except ImportError: log.error("pip install xgboost"); return None,None
-    if wavenumbers is None: wavenumbers=np.linspace(267,2004,X_train.shape[1])
+log = logging.getLogger(__name__)
+MODEL_NUM = 6
 
-    if not retrain:
-        ck=load_checkpoint(6)
-        if ck:
-            models,fn=ck["models"],ck["feature_names"]
-            Xte=preprocess_batch(X_test,"full")
-            fte,_=_feats(Xte,wavenumbers); dtest=xgb.DMatrix(fte,feature_names=fn)
-            Yp=dirichlet_normalize(np.column_stack([m.predict(dtest) for m in models]))
-            mm=evaluate(Y_test,Yp,LABEL_COLS); print_metrics(mm,"M6 Test(ck)",2); return Yp,mm
 
-    Xtr_proc=preprocess_batch(X_train,"full"); Xte_proc=preprocess_batch(X_test,"full")
-    log.info("  Trích xuất features...")
-    ftr,regions=_feats(Xtr_proc,wavenumbers); fte,_=_feats(Xte_proc,wavenumbers)
-    log.info(f"  Feature shape: {ftr.shape}")
-    fn=[]
-    for br in regions:
-        for feat in ["area","peak_h","peak_pos","FWHM","skew"]: fn.append(f"{br.name}_{feat}")
-    for seg in range(8): fn+=[f"d1_s{seg}",f"d2_s{seg}"]
-    fn=fn[:ftr.shape[1]]
-    models=[]; imp=np.zeros((6,len(fn)))
-    for j,aa in enumerate(LABEL_COLS):
-        log.info(f"  [{j+1}/6] {aa}...")
-        n_val=max(2,int(0.2*len(ftr))); idx=np.random.RandomState(j).permutation(len(ftr)); tr_i,va_i=idx[n_val:],idx[:n_val]
-        dtrain=xgb.DMatrix(ftr[tr_i],label=Y_train[tr_i,j],feature_names=fn)
-        dval=xgb.DMatrix(ftr[va_i],label=Y_train[va_i,j],feature_names=fn)
-        params={"objective":"reg:squarederror","learning_rate":CFG["learning_rate"],
-                "max_depth":CFG["max_depth"],"subsample":CFG["subsample"],
-                "colsample_bytree":CFG["colsample_bytree"],"tree_method":"hist",
-                "seed":42,"verbosity":0,"lambda":CFG["lambda"],"alpha":CFG["alpha"]}
-        bst=xgb.train(params,dtrain,num_boost_round=CFG["n_estimators"],
-                      evals=[(dval,"val")],early_stopping_rounds=CFG["early_stopping_rounds"],verbose_eval=False)
-        models.append(bst)
-        for fname,fscore in bst.get_score(importance_type="gain").items():
-            if fname in fn: imp[j,fn.index(fname)]=fscore
-    dtest=xgb.DMatrix(fte,feature_names=fn); dtr=xgb.DMatrix(ftr,feature_names=fn)
-    Yp_te=dirichlet_normalize(np.column_stack([m.predict(dtest) for m in models]))
-    Yp_tr=dirichlet_normalize(np.column_stack([m.predict(dtr)   for m in models]))
-    mtr=evaluate(Y_train,Yp_tr,LABEL_COLS); mte=evaluate(Y_test,Yp_te,LABEL_COLS)
-    elapsed=time.time()-t0; log.info(f"  Time: {elapsed:.1f}s")
-    print_metrics(mtr,"M6 Train",2); print_metrics(mte,"M6 Test",2)
+class AdaptivePreproc(nn.Module):
+    def __init__(self, in_dim, n_variants=4, drop=0.3):
+        super().__init__()
+        self.n_variants = n_variants
 
-    # R² curve (importance scores)
-    imp_m=imp.mean(0); top_idx=np.argsort(imp_m)[-15:][::-1]
-    plot_r2_curve([imp_m[i] for i in top_idx],6,"Top-15 Feature Importance (XGBoost)")
+        # Gate network
+        self.gate = nn.Sequential(
+            nn.Linear(in_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, n_variants),
+        )
 
-    # Bond detection plots for test samples
-    if X_test_raw is not None:
-        Xte_raw_proc=preprocess_batch(X_test_raw,"full")
-        # Get unique test sample spectra (median per sample)
-        unique_test_sids=list(dict.fromkeys(sid_test_raw))
-        for sid in unique_test_sids:
-            mask=sid_test_raw==sid
-            s_rep=np.median(Xte_raw_proc[mask],axis=0)
-            idx_s=np.where(mask)[0][0]
-            plot_bond_detect_batch(s_rep[None], wavenumbers, [sid], 6,
-                                   "Bond+XGBoost", Y_test_raw[idx_s:idx_s+1], LABEL_COLS)
-        # Raw scatter
-        fte_r,_=_feats(Xte_raw_proc,wavenumbers)
-        dtest_r=xgb.DMatrix(fte_r,feature_names=fn)
-        Yp_r=dirichlet_normalize(np.column_stack([m.predict(dtest_r) for m in models]))
-        plot_predictions_raw(Y_test_raw,Yp_r,sid_test_raw,6,"Bond+XGBoost",LABEL_COLS)
+        # Main predictor (same as M4 backbone)
+        self.backbone = nn.Sequential(
+            nn.Linear(in_dim, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.Dropout(drop),
+            nn.Linear(256, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Dropout(drop),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+        )
+        self.head = nn.Linear(64, C.NUM_AA)
+        self.recon_head = nn.Linear(64, in_dim)  # for reconstruction loss
 
-    plot_predictions(Y_test,Yp_te,6,"Bond+XGBoost",LABEL_COLS)
-    save_checkpoint(6,{"models":models,"feature_names":fn,"importance":imp,"wavenumbers":wavenumbers})
-    save_results(6,mte,{"Y_pred":Yp_te,"Y_true":Y_test},
-                 {"name":"Bond+XGBoost","elapsed_s":elapsed,
-                  "top5":[fn[i] for i in top_idx[:5] if i<len(fn)],
-                  "train_metrics":mtr})
+    def forward(self, x_variants, x_raw):
+        """
+        x_variants: (B, K, D) — K preprocessing variants
+        x_raw: (B, D) — raw spectrum
+        """
+        gate_w = F.softmax(self.gate(x_raw), dim=-1)  # (B, K)
+        # Weighted combination
+        x_fused = torch.sum(gate_w.unsqueeze(-1) * x_variants, dim=1)  # (B, D)
 
-    # Chemistry
-    try:
-        from chemistry_report import batch_chemistry,mean_profile,format_report,plot_bond_contribution
-        from dataclasses import asdict; import json
-        md=get_model_dir(6)
-        avg=mean_profile(batch_chemistry(Xtr_proc,wavenumbers,Y_train,LABEL_COLS))
-        print(format_report(avg,"Model 6 — Bond+XGBoost",show_composition=True))
-        plot_bond_contribution(avg,"M6-Bond+XGBoost",os.path.join(md,"model06_chemistry_bonds.png"))
-        with open(os.path.join(md,"model06_chemistry.json"),"w") as ff:
-            json.dump({"model":6,"profile":asdict(avg)},ff,indent=2,
-                      default=lambda x:float(x) if hasattr(x,"__float__") else str(x))
-    except Exception as ce: log.warning(f"  Chemistry: {ce}")
-    return Yp_te,mte
+        feat = self.backbone(x_fused)
+        pred = F.softmax(self.head(feat), dim=-1)
+        recon = self.recon_head(feat)
+        return pred, recon, gate_w, x_fused
+
+
+def total_variation(x):
+    """Total variation smoothness penalty."""
+    return torch.mean(torch.abs(x[:, 1:] - x[:, :-1]))
+
+
+def kl_loss(pred, target):
+    pred = torch.clamp(pred, 1e-8, 1.0)
+    target = torch.clamp(target, 1e-8, 1.0)
+    return F.kl_div(pred.log(), target, reduction='batchmean')
+
+
+def run(X_train, X_val, X_test, Y_train, Y_val, Y_test,
+        wavenumbers=None, retrain=False, **kw):
+    set_seeds()
+    t0 = time.time()
+    save_dir = os.path.join(C.RESULTS_DIR, f"model{MODEL_NUM:02d}")
+    os.makedirs(save_dir, exist_ok=True)
+    ckpt_path = os.path.join(C.CHECKPOINTS_DIR, f"model{MODEL_NUM:02d}.pt")
+    sid_test = kw.get("sid_test")
+
+    log.info("M06: Preprocessing variants...")
+    variants = ['none', 'snv', 'sg_snv']  # reduced from 4 to 3 for memory
+    K = len(variants)
+
+    # Preprocess all variants sequentially to save memory
+    Xtr_list = []
+    Xv_list = []
+    Xt_list = []
+    for m in variants:
+        Xtr_list.append(preprocess_batch(X_train, m))
+        Xv_list.append(preprocess_batch(X_val, m))
+        Xt_list.append(preprocess_batch(X_test, m))
+    Xtr_vars = np.stack(Xtr_list, axis=1); del Xtr_list
+    Xv_vars = np.stack(Xv_list, axis=1); del Xv_list
+    Xt_vars = np.stack(Xt_list, axis=1); del Xt_list
+    gc.collect()
+
+    Xtr_raw = preprocess_batch(X_train, 'none')
+    Xv_raw = preprocess_batch(X_val, 'none')
+    Xt_raw = preprocess_batch(X_test, 'none')
+    Xtr_full = preprocess_batch(X_train, 'sg_snv')
+
+    D = Xtr_raw.shape[1]
+
+    Xtr_vars_t = torch.tensor(Xtr_vars, dtype=torch.float32)
+    Xv_vars_t = torch.tensor(Xv_vars, dtype=torch.float32)
+    Xt_vars_t = torch.tensor(Xt_vars, dtype=torch.float32)
+    Xtr_raw_t = torch.tensor(Xtr_raw, dtype=torch.float32)
+    Xv_raw_t = torch.tensor(Xv_raw, dtype=torch.float32)
+    Xt_raw_t = torch.tensor(Xt_raw, dtype=torch.float32)
+    Xtr_full_t = torch.tensor(Xtr_full, dtype=torch.float32)
+    Ytr_t = torch.tensor(Y_train, dtype=torch.float32)
+    Yv_t = torch.tensor(Y_val, dtype=torch.float32)
+
+    model = AdaptivePreproc(D, K, C.DROPOUT)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=C.LR, weight_decay=C.WEIGHT_DECAY)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2)
+
+    train_losses, val_losses = [], []
+    best_val = float('inf')
+    patience_ctr = 0
+
+    ds = TensorDataset(Xtr_vars_t, Xtr_raw_t, Xtr_full_t, Ytr_t)
+    loader = DataLoader(ds, batch_size=C.BATCH_SIZE, shuffle=True)
+
+    log.info("M06: Training...")
+    for epoch in range(C.MAX_EPOCHS):
+        model.train()
+        ep_loss = 0
+        nb = 0
+        for xv_b, xr_b, xf_b, y_b in loader:
+            pred, recon, gw, x_fused = model(xv_b, xr_b)
+            l_kl = kl_loss(pred, y_b)
+            l_recon = F.mse_loss(recon, xf_b)
+            l_tv = total_variation(x_fused)
+            loss = l_kl + C.LAMBDA_RECON * l_recon + C.LAMBDA_SMOOTH * l_tv
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            ep_loss += loss.item()
+            nb += 1
+
+        scheduler.step()
+        train_losses.append(ep_loss / max(nb, 1))
+
+        model.eval()
+        with torch.no_grad():
+            vp, _, _, _ = model(Xv_vars_t, Xv_raw_t)
+            vl = kl_loss(vp, Yv_t).item()
+        val_losses.append(vl)
+
+        if vl < best_val:
+            best_val = vl
+            patience_ctr = 0
+            torch.save({'model': model.state_dict(), 'epoch': epoch + 1}, ckpt_path)
+        else:
+            patience_ctr += 1
+
+        if (epoch + 1) % 10 == 0:
+            log.info(f"  Epoch {epoch+1}: train={train_losses[-1]:.4f}, val={vl:.4f}")
+        if patience_ctr >= C.PATIENCE:
+            log.info(f"  Early stopping at epoch {epoch+1}")
+            break
+
+    if os.path.exists(ckpt_path):
+        model.load_state_dict(torch.load(ckpt_path, map_location='cpu', weights_only=False)['model'])
+
+    model.eval()
+    with torch.no_grad():
+        Y_pred, _, _, _ = model(Xt_vars_t, Xt_raw_t)
+        Y_pred = Y_pred.numpy()
+    Y_pred = softmax_normalize(Y_pred)
+
+    metrics = compute_metrics(Y_test, Y_pred, D)
+    metrics["epochs"] = len(train_losses)
+    metrics["training_time"] = time.time() - t0
+
+    log.info(f"M06: Test R²={metrics['R2']:.4f}, MAE={metrics['MAE']:.4f}")
+
+    plot_loss_curve(train_losses, val_losses, MODEL_NUM, save_dir)
+    plot_scatter_aggregated(Y_test, Y_pred, sid_test, MODEL_NUM, save_dir)
+    plot_scatter_raw(Y_test, Y_pred, sid_test, MODEL_NUM, save_dir)
+    save_results(metrics, MODEL_NUM, save_dir)
+
+    Xt_full = preprocess_batch(X_test, 'sg_snv')
+    avg_chem = post_process_advanced_model(Xt_full, wavenumbers, Y_pred, sid_test, MODEL_NUM, save_dir)
+    metrics["chemistry"] = avg_chem
+
+    gc.collect()
+    return Y_pred, metrics

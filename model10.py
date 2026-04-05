@@ -1,451 +1,452 @@
-"""model10.py — Radial Information Expansion Representation (RIER)"""
-import numpy as np, time, os
-import torch, torch.nn as nn, torch.optim as optim, torch.nn.functional as F
+"""
+Model 10: Radial Exhaustive Information Explorer (RIER).
+8 spoke modules (parallel branches) with gated fusion.
+Scientific discovery engine — extracts maximum information.
+"""
+import os, time, logging, gc
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.decomposition import PCA, NMF
 
-from utils import (preprocess_batch, evaluate, print_metrics,
-                   save_torch_checkpoint, load_torch_checkpoint, save_results,
-                   plot_predictions, plot_loss_curves, kl_div_loss,
-                   get_logger, get_device, INTERRUPTER, information_score, mutual_info_score)
-from spectral_knowledge import (get_active_regions, extract_bond_features, extract_derivative_features)
-from config import MODEL_CONFIGS, LABEL_COLS, get_model_dir, SAVE_EVERY_N_EPOCHS
-log=get_logger("model10"); CFG=MODEL_CONFIGS[10]; DEV=get_device()
-SPOKE_NAMES=["Raw-AE","PCA","FFT","Bond","Deriv","NMF","Moments","XCorr"]
+import config as C
+from utils import (preprocess_batch, compute_metrics, softmax_normalize, plot_scatter_aggregated, plot_scatter_raw,
+                   plot_loss_curve, save_results, set_seeds)
+from spectral_knowledge import REGIONS, N_REGIONS, extract_bond_features, extract_derivative_features
+from model_helpers import post_process_advanced_model
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
-class SpokeAE(nn.Module):
-    def __init__(self,d,lat):
+log = logging.getLogger(__name__)
+MODEL_NUM = 10
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  SPOKE MODULES
+# ═══════════════════════════════════════════════════════════════════════════
+
+class VAESpoke(nn.Module):
+    """Variational Autoencoder spoke."""
+    def __init__(self, in_dim, z_dim=32):
         super().__init__()
-        self.enc=nn.Sequential(nn.Linear(d,128),nn.ReLU(),nn.Linear(128,lat))
-        self.dec=nn.Sequential(nn.Linear(lat,128),nn.ReLU(),nn.Linear(128,d))
-    def forward(self,x): z=self.enc(x); return z,self.dec(z)
+        self.enc = nn.Sequential(nn.Linear(in_dim, 128), nn.ReLU(), nn.Linear(128, 64), nn.ReLU())
+        self.mu = nn.Linear(64, z_dim)
+        self.logvar = nn.Linear(64, z_dim)
+        self.dec = nn.Sequential(nn.Linear(z_dim, 64), nn.ReLU(), nn.Linear(64, 128), nn.ReLU(), nn.Linear(128, in_dim))
 
-class SpokePCA(nn.Module):
-    def __init__(self,d,lat):
-        super().__init__(); self.W=nn.Linear(d,lat,bias=False); nn.init.orthogonal_(self.W.weight)
-    def forward(self,x): return self.W(x),None
+    def forward(self, x):
+        h = self.enc(x)
+        mu, logvar = self.mu(h), self.logvar(h)
+        std = torch.exp(0.5 * logvar)
+        z = mu + std * torch.randn_like(std)
+        recon = self.dec(z)
+        return z, mu, logvar, recon
 
-class SpokeFFT(nn.Module):
-    def __init__(self,n_fft,lat):
-        super().__init__(); self.n=n_fft; self.net=nn.Sequential(nn.Linear(n_fft,lat),nn.ReLU())
-    def forward(self,x): return self.net(torch.fft.rfft(x,norm="ortho").abs()[:,:self.n]),None
 
-class SpokeMLP(nn.Module):
-    def __init__(self,d,lat):
-        super().__init__(); h=max(d//2,lat)
-        self.net=nn.Sequential(nn.Linear(d,h),nn.ReLU(),nn.Dropout(0.3),nn.Linear(h,lat))
-    def forward(self,x): return self.net(x),None
-
-class GatingFusion(nn.Module):
-    def __init__(self,lat,n):
+class LinearSpoke(nn.Module):
+    """Simple linear projection spoke (PCA-like)."""
+    def __init__(self, in_dim, out_dim):
         super().__init__()
-        self.gate=nn.Sequential(nn.Linear(lat*n,256),nn.ReLU(),nn.Linear(256,n),nn.Sigmoid())
-        self.norm=nn.LayerNorm(lat)
-    def forward(self,zs):
-        g=self.gate(torch.cat(zs,dim=-1))
-        fused=(torch.stack(zs,dim=1)*g.unsqueeze(-1)).sum(1)
-        return self.norm(fused),g
+        self.proj = nn.Linear(in_dim, out_dim)
+
+    def forward(self, x):
+        return self.proj(x)
+
+
+class MomentsSpoke(nn.Module):
+    """Statistical moments per segment."""
+    def __init__(self, in_dim, n_seg=8):
+        super().__init__()
+        self.n_seg = n_seg
+        self.out_dim = n_seg * 4  # mean, std, skew, kurt per segment
+        self.proj = nn.Linear(self.out_dim, 32)
+
+    def forward(self, x):
+        B, D = x.shape
+        seg_len = D // self.n_seg
+        moments = []
+        for i in range(self.n_seg):
+            lo = i * seg_len
+            hi = lo + seg_len if i < self.n_seg - 1 else D
+            seg = x[:, lo:hi]
+            m = seg.mean(dim=1, keepdim=True)
+            s = seg.std(dim=1, keepdim=True) + 1e-8
+            skew = ((seg - m) ** 3).mean(dim=1, keepdim=True) / (s ** 3)
+            kurt = ((seg - m) ** 4).mean(dim=1, keepdim=True) / (s ** 4) - 3
+            moments.extend([m, s, skew, kurt])
+        moments = torch.cat(moments, dim=1)
+        return self.proj(moments)
+
+
+class XCorrSpoke(nn.Module):
+    """Cross-correlation between first and second half."""
+    def __init__(self, in_dim, out_dim=16):
+        super().__init__()
+        half = in_dim // 2
+        self.proj = nn.Linear(half, out_dim)
+        self.half = half
+
+    def forward(self, x):
+        h1 = x[:, :self.half]
+        h2 = x[:, self.half:self.half*2]
+        # Element-wise correlation
+        corr = h1 * h2
+        return self.proj(corr)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  RIER MODEL
+# ═══════════════════════════════════════════════════════════════════════════
 
 class RIER(nn.Module):
-    def __init__(self,sd,bd,dd,nd,md,xd,lat=64,nf=32,out=6):
+    def __init__(self, in_dim, bond_feat_dim, fft_dim=32, pca_dim=30,
+                 z_dim=32, nmf_dim=8):
         super().__init__()
-        self.s0=SpokeAE(sd,lat); self.s1=SpokePCA(sd,lat)
-        self.s2=SpokeFFT(min(nf,sd//2+1),lat); self.s3=SpokeMLP(bd,lat)
-        self.s4=SpokeMLP(dd,lat); self.s5=SpokeMLP(nd,lat)
-        self.s6=SpokeMLP(md,lat); self.s7=SpokeMLP(xd,lat)
-        self.fuse=GatingFusion(lat,8)
-        self.head=nn.Sequential(nn.Linear(lat,128),nn.LayerNorm(128),nn.ReLU(),nn.Dropout(0.4),nn.Linear(128,64),nn.ReLU(),nn.Linear(64,out))
-        for m in self.modules():
-            if isinstance(m,nn.Linear) and m is not self.s1.W:
-                nn.init.kaiming_normal_(m.weight,nonlinearity="relu")
-                if m.bias is not None: nn.init.zeros_(m.bias)
-    def forward(self,b):
-        z0,xr=self.s0(b["spec"]); z1,_=self.s1(b["spec"]); z2,_=self.s2(b["spec"])
-        z3,_=self.s3(b["bond"]); z4,_=self.s4(b["deriv"]); z5,_=self.s5(b["nmf"])
-        z6,_=self.s6(b["mom"]); z7,_=self.s7(b["xcorr"])
-        zs=[z0,z1,z2,z3,z4,z5,z6,z7]; fused,g=self.fuse(zs)
-        return torch.softmax(self.head(fused),dim=-1),g,xr,zs
+        self.in_dim = in_dim
 
-def _moments(X,n=8):
-    from scipy import stats
-    N=len(X); segs=np.array_split(np.arange(X.shape[1]),n); out=np.zeros((N,4*n),dtype=np.float32)
-    for i,s in enumerate(X):
-        c=0
-        for seg in segs:
-            sg=s[seg]; out[i,c]=sg.mean(); out[i,c+1]=sg.std()
-            out[i,c+2]=float(stats.skew(sg)); out[i,c+3]=float(stats.kurtosis(sg)); c+=4
-    return out
+        # 8 spokes
+        self.vae = VAESpoke(in_dim, z_dim)           # Spoke 1: VAE
+        self.pca_spoke = LinearSpoke(in_dim, pca_dim) # Spoke 2: PCA-like
+        self.fft_spoke = LinearSpoke(fft_dim, 32)     # Spoke 3: FFT
+        self.bond_spoke = LinearSpoke(bond_feat_dim, 32)  # Spoke 4: Bond stats
+        self.deriv_spoke = LinearSpoke(16, 16)        # Spoke 5: Derivatives
+        self.nmf_spoke = LinearSpoke(nmf_dim, 16)     # Spoke 6: NMF
+        self.moments_spoke = MomentsSpoke(in_dim)     # Spoke 7: Moments
+        self.xcorr_spoke = XCorrSpoke(in_dim, 16)    # Spoke 8: XCorr
 
-def _xcorr(X,n=16):
-    N,L=X.shape; h=L//2; out=np.zeros((N,n),dtype=np.float32)
-    for i,s in enumerate(X):
-        a=s[:h]-s[:h].mean(); b=s[h:h+h]-s[h:h+h].mean(); ml=min(len(a),len(b))
-        corr=np.correlate(a[:ml],b[:ml],"full"); mid=len(corr)//2; hn=n//2
-        out[i]=corr[mid-hn:mid+hn]
-    return (out/(np.abs(out).max(1,keepdims=True)+1e-8)).astype(np.float32)
+        # Spoke output dimensions
+        spoke_dims = [z_dim, pca_dim, 32, 32, 16, 16, 32, 16]
+        total_dim = sum(spoke_dims)
 
-def _prep(X,wns,nmf):
-    from sklearn.preprocessing import StandardScaler
-    reg=get_active_regions(wns)
-    bf=np.array([extract_bond_features(s,wns,reg) for s in X])
-    df=np.array([extract_derivative_features(s,wns,n_seg=6) for s in X])
-    mom=_moments(X); xcr=_xcorr(X)
-    Xn=np.maximum(X,0); Xn-=Xn.min(axis=1,keepdims=True)
-    nf=nmf.transform(Xn).astype(np.float32)
-    return {"spec":X.astype(np.float32),"bond":bf,"deriv":df,"nmf":nf,"mom":mom,"xcorr":xcr}
+        # Gate network
+        self.gate = nn.Sequential(
+            nn.Linear(total_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 8),
+            nn.Sigmoid(),
+        )
 
-def _to_dev(d): return {k:torch.tensor(v).to(DEV) for k,v in d.items()}
-def _sl(d,idx): return {k:v[idx] for k,v in d.items()}
+        # Spoke projections to common dim
+        self.spoke_projs = nn.ModuleList([
+            nn.Linear(d, 32) for d in spoke_dims
+        ])
 
-def _aug(d,Y,n=4):
-    aug={k:[v] for k,v in d.items()}; Ya=[Y]; N=len(Y)
-    for _ in range(n):
-        for k in aug: aug[k].append(d[k]+np.random.randn(*d[k].shape).astype(np.float32)*0.01)
-        Ya.append(Y)
-    for _ in range(n):
-        idx=np.random.randint(N,size=N); lam=np.random.beta(0.3,0.3,size=(N,1)).astype(np.float32)
-        for k in aug: aug[k].append(lam*d[k]+(1-lam)*d[k][idx])
-        Ya.append(lam*Y+(1-lam)*Y[idx])
-    return {k:np.vstack(v).astype(np.float32) for k,v in aug.items()},np.vstack(Ya).astype(np.float32)
+        # Fusion
+        self.fusion = nn.Sequential(
+            nn.Linear(32 * 8, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+        )
+        self.head = nn.Linear(64, C.NUM_AA)
 
-def _pred_all(model,feats,bs):
-    N=len(feats["spec"]); ps=[]
-    for s in range(0,N,bs):
-        with torch.no_grad(): p,_,_,_=model(_to_dev(_sl(feats,np.arange(s,min(s+bs,N))))); ps.append(p.cpu().numpy())
-    return np.vstack(ps)
+    def forward(self, x, fft_feat, bond_feat, deriv_feat, nmf_feat):
+        # Compute all spokes
+        z_vae, mu, logvar, recon = self.vae(x)
+        z_pca = self.pca_spoke(x)
+        z_fft = self.fft_spoke(fft_feat)
+        z_bond = self.bond_spoke(bond_feat)
+        z_deriv = self.deriv_spoke(deriv_feat)
+        z_nmf = self.nmf_spoke(nmf_feat)
+        z_mom = self.moments_spoke(x)
+        z_xcorr = self.xcorr_spoke(x)
 
-def _gates_all(model,feats,bs):
-    N=len(feats["spec"]); gs=[]
-    for s in range(0,N,bs):
-        with torch.no_grad(): _,g,_,_=model(_to_dev(_sl(feats,np.arange(s,min(s+bs,N))))); gs.append(g.cpu().numpy())
-    return np.vstack(gs)
+        spokes = [z_vae, z_pca, z_fft, z_bond, z_deriv, z_nmf, z_mom, z_xcorr]
 
-def _latents_all(model,feats,bs):
-    N=len(feats["spec"]); lats=[[] for _ in range(8)]
-    for s in range(0,N,bs):
-        with torch.no_grad(): _,_,_,zs=model(_to_dev(_sl(feats,np.arange(s,min(s+bs,N)))))
-        for k,z in enumerate(zs): lats[k].append(z.cpu().numpy())
-    return [np.vstack(l) for l in lats]
+        # Concatenate for gate
+        z_cat = torch.cat(spokes, dim=-1)
+        gates = self.gate(z_cat)  # (B, 8)
 
-def _info(lats,gates,Y):
-    rep={}
-    for k,(nm,z) in enumerate(zip(SPOKE_NAMES,lats)):
-        er=information_score(z); mi=mutual_info_score(z,Y); gw=float(gates[:,k].mean())
-        rep[nm]={"effective_rank":er,"mi_score":mi,"gate_weight":gw,"radial_score":er/100*0.4+mi*0.4+gw*0.2}
-    rep["total_radius"]=sum(v["radial_score"] for v in rep.values() if isinstance(v,dict))
-    return rep
+        # Project and gate
+        projected = []
+        for i, (z, proj) in enumerate(zip(spokes, self.spoke_projs)):
+            projected.append(gates[:, i:i+1] * proj(z))
 
-def _print_info(rep):
-    log.info(f"  {'Spoke':<12} {'Eff.Rank':>10} {'MI':>8} {'Gate':>8} {'Radius':>10}")
-    log.info("  "+"─"*52)
-    for n,v in sorted([(k,v) for k,v in rep.items() if isinstance(v,dict)],key=lambda x:x[1]["radial_score"],reverse=True):
-        log.info(f"  {n:<12} {v['effective_rank']:>10.2f} {v['mi_score']:>8.4f} {v['gate_weight']:>8.4f} {v['radial_score']:>10.4f}")
-    log.info(f"  Total radius = {rep.get('total_radius',0):.4f}")
+        fused = torch.cat(projected, dim=-1)
+        feat = self.fusion(fused)
+        pred = F.softmax(self.head(feat), dim=-1)
 
-def _plot_radial(rep, mid):
-    """Spoke flowgraph: 8 nhánh xử lý hội tụ về dự đoán cuối cùng"""
-    import matplotlib; matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    import matplotlib.patches as mpatches
-    from matplotlib.patches import FancyArrowPatch, FancyBboxPatch
+        return pred, mu, logvar, recon, gates
 
-    spk = {k:v for k,v in rep.items() if isinstance(v,dict)}
-    # Định nghĩa pipeline cho mỗi spoke (input → method → output)
-    PIPELINES = {
-        "Raw-AE":  ("Raw spectrum",  ["Autoencoder"],         "Latent-AE",   "#E8593C"),
-        "PCA":     ("Raw spectrum",  ["PCA"],                  "PCA scores",  "#3B8BD4"),
-        "FFT":     ("Raw spectrum",  ["FFT", "Filter"],        "Freq. repr.", "#534AB7"),
-        "Bond":    ("Preprocessed",  ["ALS","Bond extract"],   "Bond feats",  "#1D9E75"),
-        "Deriv":   ("Preprocessed",  ["SG deriv."],            "Deriv. feats","#EF9F27"),
-        "NMF":     ("Preprocessed",  ["NMF (MCR-ALS)"],        "Comp. conc.", "#D4537E"),
-        "Moments": ("Preprocessed",  ["Seg. moments"],         "Stat. feats", "#5DCAA5"),
-        "XCorr":   ("Raw spectrum",  ["Cross-corr."],          "Corr. feats", "#888780"),
-    }
-    n_spokes = len(PIPELINES)
-    fig_h = n_spokes * 1.2 + 2.0
-    fig, ax = plt.subplots(figsize=(14, fig_h)); ax.set_xlim(0,14); ax.set_ylim(0, fig_h)
-    ax.axis("off"); ax.set_facecolor("#FAFAFA")
-    fig.patch.set_facecolor("#FAFAFA")
 
-    # Header
-    ax.text(7, fig_h-0.6, "RIER — Spoke Processing Flowgraph",
-            ha="center", va="center", fontsize=13, fontweight="bold")
-    ax.text(7, fig_h-1.1, "Input → Methods → Feature → Fusion → Prediction",
-            ha="center", va="center", fontsize=9, color="#555")
+def _compute_fft_features(X, n_freq=32):
+    """FFT magnitude features (low frequencies)."""
+    fft_feats = np.zeros((len(X), n_freq), dtype=np.float32)
+    for i in range(len(X)):
+        fft = np.fft.rfft(X[i])
+        mag = np.abs(fft)[:n_freq]
+        if len(mag) < n_freq:
+            mag = np.pad(mag, (0, n_freq - len(mag)))
+        fft_feats[i] = mag
+    return fft_feats
 
-    # Column x-positions
-    COL = {"input":1.2, "methods":4.5, "feature":9.0, "gate":11.5, "fusion":13.2}
-    # Draw column labels
-    for label, x in [("Input source",1.2),("Processing pipeline",4.5),("Feature output",9.0),("Gate",11.5)]:
-        ax.text(x, fig_h-1.6, label, ha="center", fontsize=8, color="#777", style="italic")
 
-    # Fusion box (right side, center)
-    fy = fig_h/2 - 0.3
-    fusion_box = FancyBboxPatch((12.5, fy-0.5), 1.2, 1.0, boxstyle="round,pad=0.1",
-                                 fc="#2C2C2A", ec="white", lw=1.5)
-    ax.add_patch(fusion_box)
-    ax.text(13.1, fy, "Gated\nFusion", ha="center", va="center", fontsize=8, color="white", fontweight="bold")
+def _compute_nmf_features(X_train, X, n_comp=8):
+    """NMF features."""
+    X_nn = np.maximum(X_train, 0) + 1e-10
+    nmf = NMF(n_components=n_comp, max_iter=200, random_state=C.SEED, init='nndsvda')
+    nmf.fit(X_nn)
+    X_nn2 = np.maximum(X, 0) + 1e-10
+    return nmf.transform(X_nn2).astype(np.float32), nmf
 
-    # Prediction node
-    pred_box = FancyBboxPatch((12.6, fy-2.0), 1.0, 0.7, boxstyle="round,pad=0.1",
-                               fc="#534AB7", ec="white", lw=1.5)
-    ax.add_patch(pred_box)
-    ax.text(13.1, fy-1.65, "Pred\n(AA%)", ha="center", va="center", fontsize=8, color="white", fontweight="bold")
-    ax.annotate("", xy=(13.1, fy-1.3), xytext=(13.1, fy-0.5),
-                arrowprops=dict(arrowstyle="->", color="#534AB7", lw=2))
 
-    spoke_names = list(PIPELINES.keys())
-    y_positions = np.linspace(fig_h-2.3, 0.7, n_spokes)
+def _compute_deriv_features(X, wavenumbers):
+    """Derivative features."""
+    feats = np.zeros((len(X), 16), dtype=np.float32)
+    for i in range(len(X)):
+        feats[i] = extract_derivative_features(X[i], wavenumbers)
+    return feats
 
-    for i, (spoke_name, y_pos) in enumerate(zip(spoke_names, y_positions)):
-        src, methods, output, color = PIPELINES[spoke_name]
-        gate_w = spk.get(spoke_name, {}).get("gate_weight", 0.)
-        mi_v   = spk.get(spoke_name, {}).get("mi_score", 0.)
-        r_v    = spk.get(spoke_name, {}).get("radial_score", 0.)
 
-        alpha = 0.5 + 0.5 * min(gate_w * 3, 1.)  # brighter = higher gate
+def _compute_bond_features(X, wavenumbers):
+    """Bond statistics."""
+    feats = []
+    for i in range(len(X)):
+        bf = extract_bond_features(X[i], wavenumbers, REGIONS).flatten()
+        feats.append(bf)
+    return np.array(feats, dtype=np.float32)
 
-        # ── Input bubble ──────────────────────────────────────────────────
-        ax.text(COL["input"], y_pos, src, ha="center", va="center", fontsize=7.5,
-                bbox=dict(boxstyle="round,pad=0.3", fc=color, ec="white", alpha=0.25), color="#333")
 
-        # ── Arrow input→methods ───────────────────────────────────────────
-        ax.annotate("", xy=(COL["methods"]-1.3, y_pos), xytext=(COL["input"]+0.55, y_pos),
-                    arrowprops=dict(arrowstyle="->", color=color, lw=1.2, alpha=alpha))
+def plot_radial_diagram(gate_weights, save_dir, model_num):
+    """Plot flower-shaped DAG: INPUT → 8 spokes → FUSION, line width ∝ gate weight."""
+    spoke_names = ['VAE', 'PCA', 'FFT', 'BondStats', 'Derivatives', 'NMF', 'Moments', 'XCorr']
+    spoke_methods = ['Autoencoder', 'Linear proj', 'Fourier mag', 'Bond features',
+                     'd1,d2 segments', 'Decomposition', 'Statistics', 'Cross-corr']
+    spoke_dims = [32, 30, 32, 50, 16, 8, 32, 16]
+    spoke_colors = ['#e74c3c', '#2ecc71', '#f39c12', '#9b59b6',
+                    '#1abc9c', '#e67e22', '#3498db', '#e91e63']
+    mean_gates = gate_weights.mean(axis=0)
 
-        # ── Method nodes (chain) ──────────────────────────────────────────
-        n_m = len(methods)
-        x_starts = np.linspace(COL["methods"]-1.2, COL["methods"]+1.2, n_m)
-        for j, (method, xm) in enumerate(zip(methods, x_starts)):
-            mb = FancyBboxPatch((xm-0.55, y_pos-0.22), 1.1, 0.44,
-                                boxstyle="round,pad=0.08", fc=color, ec="white",
-                                alpha=alpha*0.8, lw=1.)
-            ax.add_patch(mb)
-            ax.text(xm, y_pos, method, ha="center", va="center",
-                    fontsize=7, color="white", fontweight="bold")
-            if j < n_m-1:
-                ax.annotate("", xy=(x_starts[j+1]-0.55, y_pos),
-                            xytext=(xm+0.55, y_pos),
-                            arrowprops=dict(arrowstyle="->", color=color, lw=0.8, alpha=0.7))
+    fig, ax = plt.subplots(figsize=(10, 10))
+    ax.set_xlim(-1.6, 1.6)
+    ax.set_ylim(-1.6, 1.6)
+    ax.set_aspect('equal')
+    ax.axis('off')
 
-        # ── Arrow methods→feature ─────────────────────────────────────────
-        ax.annotate("", xy=(COL["feature"]-0.7, y_pos), xytext=(x_starts[-1]+0.55, y_pos),
-                    arrowprops=dict(arrowstyle="->", color=color, lw=1.2, alpha=alpha))
+    # Central INPUT node
+    cx, cy = 0, 0
+    circ = plt.Circle((cx, cy), 0.22, color='#3498db', zorder=10)
+    ax.add_patch(circ)
+    ax.text(cx, cy + 0.04, 'INPUT', ha='center', va='center', fontsize=10,
+            fontweight='bold', color='white', zorder=11)
+    ax.text(cx, cy - 0.06, 'Spectrum', ha='center', va='center', fontsize=8,
+            color='white', zorder=11)
 
-        # ── Feature output box ────────────────────────────────────────────
-        fb = FancyBboxPatch((COL["feature"]-0.65, y_pos-0.22), 1.3, 0.44,
-                            boxstyle="round,pad=0.08", fc=color, ec="white", alpha=0.2, lw=1.)
-        ax.add_patch(fb)
-        ax.text(COL["feature"], y_pos, output, ha="center", va="center",
-                fontsize=7.5, color="#333", style="italic")
+    # FUSION node at bottom
+    fx, fy = 0, -1.35
+    circ_f = plt.Circle((fx, fy), 0.18, color='#2c3e50', zorder=10)
+    ax.add_patch(circ_f)
+    ax.text(fx, fy + 0.03, 'FUSION', ha='center', va='center', fontsize=9,
+            fontweight='bold', color='white', zorder=11)
+    ax.text(fx, fy - 0.06, '→ŷ', ha='center', va='center', fontsize=9,
+            color='#ecf0f1', zorder=11)
 
-        # ── Gate bar ──────────────────────────────────────────────────────
-        bar_w = gate_w * 1.5; bar_x = COL["gate"]-0.75
-        ax.barh(y_pos, bar_w, left=bar_x, height=0.28, color=color, alpha=0.7)
-        ax.text(bar_x + max(bar_w, 0.02) + 0.05, y_pos, f"{gate_w:.3f}",
-                va="center", fontsize=7, color="#333")
+    n = len(spoke_names)
+    angles = np.linspace(np.pi * 0.15, np.pi * 0.85, n)  # upper semicircle
 
-        # ── Arrow feature→fusion (curved) ─────────────────────────────────
-        ax.annotate("",
-                    xy=(12.5, fy),
-                    xytext=(COL["feature"]+0.65, y_pos),
-                    arrowprops=dict(arrowstyle="->", color=color, lw=1.0, alpha=0.3,
-                                    connectionstyle=f"arc3,rad={0.1*(i-n_spokes//2)*0.15}"))
+    for i in range(n):
+        ang = angles[i]
+        r_spoke = 1.1
+        sx = r_spoke * np.cos(ang)
+        sy = r_spoke * np.sin(ang)
 
-        # ── Spoke label (right margin) ────────────────────────────────────
-        ax.text(0.1, y_pos, f"{spoke_name}", ha="left", va="center",
-                fontsize=8, color=color, fontweight="bold")
+        g = mean_gates[i]
+        lw = max(1.0, g * 8)  # line width ∝ gate weight
+        alpha = max(0.25, g)
 
-    # ── Gate column header bar ────────────────────────────────────────────────
-    ax.axvline(x=COL["gate"]-0.75, color="#ccc", lw=0.5, ymin=0.05, ymax=0.93)
-    ax.text(COL["gate"]+0.35, fig_h-1.6, "Gate\n(0→1)", ha="center", fontsize=7, color="#777", style="italic")
+        # Line: center → spoke
+        ax.plot([cx, sx], [cy, sy], '-', color=spoke_colors[i],
+                linewidth=lw, alpha=alpha, zorder=3)
+        # Line: spoke → fusion
+        ax.plot([sx, fx], [sy, fy], '-', color=spoke_colors[i],
+                linewidth=lw * 0.6, alpha=alpha * 0.7, zorder=3)
 
-    # ── Info box ──────────────────────────────────────────────────────────────
-    info_str = "\n".join([
-        f"nhánh {i+1}: {nm} → {PIPELINES[nm][1][0]} → {PIPELINES[nm][2]}"
-        for i, nm in enumerate(spoke_names)
-    ])
-    ax.text(0.1, 0.3, info_str, ha="left", va="bottom", fontsize=6.5,
-            color="#555", family="monospace")
+        # Spoke node
+        node_r = 0.12 + g * 0.06
+        circ_s = plt.Circle((sx, sy), node_r, color=spoke_colors[i],
+                            zorder=10, alpha=0.9)
+        ax.add_patch(circ_s)
+        ax.text(sx, sy + 0.02, spoke_names[i], ha='center', va='center',
+                fontsize=8, fontweight='bold', color='white', zorder=11)
+        ax.text(sx, sy - 0.06, f'd={spoke_dims[i]}', ha='center', va='center',
+                fontsize=6, color='white', zorder=11)
 
-    plt.tight_layout(rect=[0,0,1,1])
-    out_path = os.path.join(get_model_dir(mid), f"model{mid:02d}_radial_info.png")
-    plt.savefig(out_path, dpi=120, bbox_inches="tight")
-    plt.close()
+        # Gate weight label
+        lx = sx + 0.25 * np.cos(ang)
+        ly = sy + 0.25 * np.sin(ang)
+        ax.text(lx, ly, f'g={g:.2f}', fontsize=7, ha='center', va='center',
+                color=spoke_colors[i], fontweight='bold')
 
-def run(X_train, X_test, Y_train, Y_test, wavenumbers=None, retrain=False, **kw):
-    log.info("="*60); log.info("Model 10 — RIER"); log.info(f"  N_train={len(X_train)}, N_test={len(X_test)}"); log.info("="*60)
-    if wavenumbers is None: wavenumbers=np.linspace(400,1800,X_train.shape[1])
-    from sklearn.decomposition import NMF; from sklearn.preprocessing import MinMaxScaler, StandardScaler
-    Xb=np.maximum(preprocess_batch(X_train,"snv"),0); Xb-=Xb.min(axis=1,keepdims=True)
-    nmf=NMF(n_components=min(8,len(X_train)-1),init="nndsvda",max_iter=500,random_state=42); nmf.fit(Xb)
-    Xtr=preprocess_batch(X_train,"full"); Xte=preprocess_batch(X_test,"full")
-    sc=MinMaxScaler(); Xtr=sc.fit_transform(Xtr).astype(np.float32); Xte=sc.transform(Xte).astype(np.float32)
-    log.info("  Trích xuất 8 spoke features...")
-    ftr=_prep(Xtr,wavenumbers,nmf); fte=_prep(Xte,wavenumbers,nmf)
-    for k in ["bond","deriv","nmf","mom","xcorr"]:
-        s2=StandardScaler(); ftr[k]=s2.fit_transform(ftr[k]).astype(np.float32); fte[k]=s2.transform(fte[k]).astype(np.float32)
-    faug,Yaug=_aug(ftr,Y_train,n=4); dims={k:ftr[k].shape[1] for k in ftr}
-    log.info(f"  Dims: {dims}")
-    model=RIER(dims["spec"],dims["bond"],dims["deriv"],dims["nmf"],dims["mom"],dims["xcorr"],
-               lat=CFG["latent_dim"],nf=min(CFG["n_fft_components"],dims["spec"]//2+1)).to(DEV)
-    log.info(f"  Params: {sum(p.numel() for p in model.parameters()):,}")
-    opt=optim.AdamW(model.parameters(),lr=CFG["lr"],weight_decay=CFG["weight_decay"])
-    sch=optim.lr_scheduler.CosineAnnealingWarmRestarts(opt,T_0=50,T_mult=2)
-    start_ep=0; best_val=-np.inf; no_imp=0; hist={"R2":{"train":[],"val":[]}}
-    if not retrain:
-        ck=load_torch_checkpoint(10,"resume")
-        if ck:
-            model.load_state_dict(ck["model"]); opt.load_state_dict(ck["opt"]); sch.load_state_dict(ck["sch"])
-            start_ep=ck["epoch"]+1; best_val=ck["best_val"]; hist=ck["hist"]; no_imp=ck["no_imp"]
-            log.info(f"  Resume ep {start_ep}")
-        else:
-            ck2=load_torch_checkpoint(10,"best")
-            if ck2:
-                model.load_state_dict(ck2["model"]); model.eval()
-                Yp=_pred_all(model,fte,CFG["batch_size"]); m=evaluate(Y_test,Yp,LABEL_COLS)
-                print_metrics(m,"M10 Test(ck)",2)
-                info=_info(_latents_all(model,fte,CFG["batch_size"]),_gates_all(model,fte,CFG["batch_size"]),Y_test)
-                _print_info(info); _plot_radial(info,10); return Yp,m
-    from sklearn.metrics import r2_score as r2
-    n_val=max(2,int(0.2*len(ftr["spec"]))); idx=np.random.RandomState(42).permutation(len(ftr["spec"])); va_idx=idx[:n_val]
-    fva=_sl(ftr,va_idx); N=len(faug["spec"]); bs=CFG["batch_size"]
-    INTERRUPTER.reset(); t0=time.time()
-    for ep in range(start_ep,CFG["max_epochs"]):
-        if INTERRUPTER.stop_requested: break
-        model.train(); tl=0.; nb=0; perm=np.random.permutation(N)
-        for s in range(0,N,bs):
-            b=perm[s:s+bs]; batch=_to_dev(_sl(faug,b)); Yb=torch.tensor(Yaug[b],dtype=torch.float32).to(DEV)
-            opt.zero_grad(); p,g,xr,zs=model(batch)
-            loss=kl_div_loss(p,Yb)+CFG["recon_weight"]*F.mse_loss(xr,batch["spec"])
-            div=sum(F.cosine_similarity(zs[i],zs[j]).clamp(0).mean() for i in range(8) for j in range(i+1,8))/28
-            (loss+CFG["diversity_weight"]*div).backward(); nn.utils.clip_grad_norm_(model.parameters(),2.); opt.step(); tl+=loss.item(); nb+=1
-        sch.step(); tl/=max(nb,1)
+    ax.set_title(f"Model {model_num}: RIER — Radial Exhaustive Explorer\n"
+                 f"Line width ∝ gate weight", fontsize=13, fontweight='bold', pad=10)
+    plt.tight_layout()
+    out = os.path.join(save_dir, f"model{model_num:02d}_radial.png")
+    fig.savefig(out, dpi=C.FIG_DPI, bbox_inches='tight')
+    plt.close(fig)
+    log.info(f"  Saved {out}")
+
+
+def run(X_train, X_val, X_test, Y_train, Y_val, Y_test,
+        wavenumbers=None, retrain=False, **kw):
+    set_seeds()
+    t0 = time.time()
+    save_dir = os.path.join(C.RESULTS_DIR, f"model{MODEL_NUM:02d}")
+    os.makedirs(save_dir, exist_ok=True)
+    ckpt_path = os.path.join(C.CHECKPOINTS_DIR, f"model{MODEL_NUM:02d}.pt")
+    sid_test = kw.get("sid_test")
+
+    log.info("M10: Preprocessing and feature extraction...")
+    Xtr = preprocess_batch(X_train, 'sg_snv')
+    Xv = preprocess_batch(X_val, 'sg_snv')
+    Xt = preprocess_batch(X_test, 'sg_snv')
+    D = Xtr.shape[1]
+
+    # FFT features
+    fft_tr = _compute_fft_features(Xtr)
+    fft_v = _compute_fft_features(Xv)
+    fft_t = _compute_fft_features(Xt)
+
+    # Bond features
+    bond_tr = _compute_bond_features(Xtr, wavenumbers)
+    bond_v = _compute_bond_features(Xv, wavenumbers)
+    bond_t = _compute_bond_features(Xt, wavenumbers)
+
+    # Derivative features
+    deriv_tr = _compute_deriv_features(Xtr, wavenumbers)
+    deriv_v = _compute_deriv_features(Xv, wavenumbers)
+    deriv_t = _compute_deriv_features(Xt, wavenumbers)
+
+    # NMF features
+    log.info("M10: Computing NMF features...")
+    nmf_tr, nmf_model = _compute_nmf_features(Xtr, Xtr, C.RIER_NMF_K)
+    nmf_v = nmf_model.transform(np.maximum(Xv, 0) + 1e-10).astype(np.float32)
+    nmf_t = nmf_model.transform(np.maximum(Xt, 0) + 1e-10).astype(np.float32)
+
+    bond_dim = bond_tr.shape[1]
+
+    # Tensors
+    Xtr_t = torch.tensor(Xtr, dtype=torch.float32)
+    Xv_t = torch.tensor(Xv, dtype=torch.float32)
+    Xt_t = torch.tensor(Xt, dtype=torch.float32)
+    Ytr_t = torch.tensor(Y_train, dtype=torch.float32)
+    Yv_t = torch.tensor(Y_val, dtype=torch.float32)
+
+    fft_tr_t = torch.tensor(fft_tr, dtype=torch.float32)
+    fft_v_t = torch.tensor(fft_v, dtype=torch.float32)
+    fft_t_t = torch.tensor(fft_t, dtype=torch.float32)
+    bond_tr_t = torch.tensor(bond_tr, dtype=torch.float32)
+    bond_v_t = torch.tensor(bond_v, dtype=torch.float32)
+    bond_t_t = torch.tensor(bond_t, dtype=torch.float32)
+    deriv_tr_t = torch.tensor(deriv_tr, dtype=torch.float32)
+    deriv_v_t = torch.tensor(deriv_v, dtype=torch.float32)
+    deriv_t_t = torch.tensor(deriv_t, dtype=torch.float32)
+    nmf_tr_t = torch.tensor(nmf_tr, dtype=torch.float32)
+    nmf_v_t = torch.tensor(nmf_v, dtype=torch.float32)
+    nmf_t_t = torch.tensor(nmf_t, dtype=torch.float32)
+
+    model = RIER(D, bond_dim, fft_dim=32, pca_dim=30,
+                 z_dim=C.RIER_Z_DIM, nmf_dim=C.RIER_NMF_K)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=C.LR, weight_decay=C.WEIGHT_DECAY)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2)
+
+    ds = TensorDataset(Xtr_t, fft_tr_t, bond_tr_t, deriv_tr_t, nmf_tr_t, Ytr_t)
+    loader = DataLoader(ds, batch_size=C.BATCH_SIZE, shuffle=True)
+
+    train_losses, val_losses = [], []
+    best_val = float('inf')
+    patience_ctr = 0
+
+    log.info("M10: Training RIER...")
+    for epoch in range(C.MAX_EPOCHS):
+        model.train()
+        ep_loss = 0
+        nb = 0
+
+        for xb, fb, bb, db, nb_f, yb in loader:
+            pred, mu, logvar, recon, gates = model(xb, fb, bb, db, nb_f)
+
+            # KL div for composition
+            l_kl = F.kl_div(torch.clamp(pred, 1e-8).log(),
+                            torch.clamp(yb, 1e-8), reduction='batchmean')
+
+            # VAE reconstruction
+            l_recon = F.mse_loss(recon, xb)
+
+            # VAE KL
+            l_vae_kl = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+
+            # Spoke diversity (encourage different spokes to activate)
+            l_div = -torch.mean(gates.std(dim=0))
+
+            loss = l_kl + 0.01 * l_recon + 0.001 * l_vae_kl + 0.01 * l_div
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            ep_loss += loss.item()
+            nb += 1
+
+        scheduler.step()
+        train_losses.append(ep_loss / max(nb, 1))
+
         model.eval()
         with torch.no_grad():
-            pv,_,_,_=model(_to_dev(fva)); vl=r2(Y_train[va_idx],pv.cpu().numpy(),multioutput="uniform_average")
-        hist["R2"]["train"].append(-tl); hist["R2"]["val"].append(vl)
-        if ep%20==0: log.info(f"  Ep{ep:4d}: loss={tl:.5f} val_R²={vl:.4f}")
-        if vl>best_val: best_val=vl; no_imp=0; save_torch_checkpoint(10,{"model":model.state_dict()},"best")
-        else: no_imp+=1
-        if ep%SAVE_EVERY_N_EPOCHS==0:
-            save_torch_checkpoint(10,{"model":model.state_dict(),"opt":opt.state_dict(),"sch":sch.state_dict(),"epoch":ep,"best_val":best_val,"hist":hist,"no_imp":no_imp},"resume")
-        if no_imp>=CFG["patience"]: log.info(f"  Early stop ep {ep}"); break
-    ck2=load_torch_checkpoint(10,"best")
-    if ck2: model.load_state_dict(ck2["model"])
+            vp, _, _, _, _ = model(Xv_t, fft_v_t, bond_v_t, deriv_v_t, nmf_v_t)
+            vl = F.kl_div(torch.clamp(vp, 1e-8).log(),
+                          torch.clamp(Yv_t, 1e-8), reduction='batchmean').item()
+        val_losses.append(vl)
+
+        if vl < best_val:
+            best_val = vl
+            patience_ctr = 0
+            torch.save({'model': model.state_dict(), 'epoch': epoch + 1}, ckpt_path)
+        else:
+            patience_ctr += 1
+
+        if (epoch + 1) % 10 == 0:
+            log.info(f"  Epoch {epoch+1}: train={train_losses[-1]:.4f}, val={vl:.4f}")
+        if patience_ctr >= C.PATIENCE:
+            log.info(f"  Early stopping at epoch {epoch+1}")
+            break
+
+    if os.path.exists(ckpt_path):
+        model.load_state_dict(torch.load(ckpt_path, map_location='cpu', weights_only=False)['model'])
+
     model.eval()
-    Yp_te=_pred_all(model,fte,bs); Yp_tr=_pred_all(model,ftr,bs)
-    lats_te=_latents_all(model,fte,bs); gates_te=_gates_all(model,fte,bs)
-    mtr=evaluate(Y_train,Yp_tr,LABEL_COLS); mte=evaluate(Y_test,Yp_te,LABEL_COLS)
-    elapsed=time.time()-t0; log.info(f"  Time: {elapsed:.1f}s")
-    print_metrics(mtr,"M10 Train",2); print_metrics(mte,"M10 Test",2)
-    log.info("\n  ─── Radial Information Report ───────────────")
-    info=_info(lats_te,gates_te,Y_test); _print_info(info); _plot_radial(info,10)
-    plot_loss_curves(hist,10,"RIER"); plot_predictions(Y_test,Yp_te,10,"RIER",LABEL_COLS)
+    with torch.no_grad():
+        Y_pred, _, _, _, gate_weights = model(Xt_t, fft_t_t, bond_t_t, deriv_t_t, nmf_t_t)
+        Y_pred = Y_pred.numpy()
+        gate_weights = gate_weights.numpy()
 
-    # ── Raw scatter (QUAN TRỌNG: 6 nhóm điểm) ─────────────────────────────
-    X_te_raw=kw.get("X_test_raw"); Y_te_raw=kw.get("Y_test_raw"); sid_te_raw=kw.get("sid_test_raw")
-    if X_te_raw is not None:
-        from utils import plot_predictions_raw
-        Xte_r=preprocess_batch(X_te_raw,"full")
-        sc_r=MinMaxScaler(); sc_r.fit(preprocess_batch(X_train,"full"))
-        Xte_r2=sc_r.transform(Xte_r).astype(np.float32)
-        fte_r=_prep(Xte_r2,wavenumbers,nmf)
-        for k2 in ["bond","deriv","nmf","mom","xcorr"]:
-            s_tmp=StandardScaler(); s_tmp.fit(ftr[k2]); fte_r[k2]=s_tmp.transform(fte_r[k2]).astype(np.float32)
-        Yp_r=_pred_all(model,fte_r,bs)
-        plot_predictions_raw(Y_te_raw,Yp_r,sid_te_raw,10,"RIER",LABEL_COLS)
-        from utils import plot_bond_detect_batch
-        unique_sids=list(dict.fromkeys(sid_te_raw))
-        for sid in unique_sids:
-            mask=sid_te_raw==sid; s_rep=np.median(Xte_r[mask],axis=0); idx_s=np.where(mask)[0][0]
-            plot_bond_detect_batch(s_rep[None],wavenumbers,[sid],10,"RIER",Y_te_raw[idx_s:idx_s+1],LABEL_COLS)
+    Y_pred = softmax_normalize(Y_pred)
 
-    # ── COMPREHENSIVE CHEMISTRY — phần chính của RIER ─────────────────────
-    try:
-        from chemistry_report import (batch_chemistry, mean_profile, format_report,
-                                       plot_bond_contribution, compare_models,
-                                       save_chemistry_json, ChemistryProfile)
-        from dataclasses import asdict; import json
+    metrics = compute_metrics(Y_test, Y_pred, D)
+    metrics["epochs"] = len(train_losses)
+    metrics["training_time"] = time.time() - t0
 
+    # Spoke analysis
+    spoke_names = ['VAE', 'PCA', 'FFT', 'BondStats', 'Derivatives', 'NMF', 'Moments', 'XCorr']
+    mean_gates = gate_weights.mean(axis=0)
+    metrics["spoke_gate_weights"] = {n: float(g) for n, g in zip(spoke_names, mean_gates)}
+    metrics["novel_chains"] = [n for n, g in zip(spoke_names, mean_gates) if g > 0.5]
 
-        X_proc=preprocess_batch(X_train,"full")
-        train_profiles=batch_chemistry(X_proc,wavenumbers,Y_train,LABEL_COLS)
-        avg_chem=mean_profile(train_profiles)
+    log.info(f"M10: Test R²={metrics['R2']:.4f}, MAE={metrics['MAE']:.4f}")
+    log.info(f"M10: Spoke weights: {dict(zip(spoke_names, [f'{g:.3f}' for g in mean_gates]))}")
 
-        # ── 1. Báo cáo tổng hợp ───────────────────────────────────────────
-        print(); print("="*60)
-        print("  RIER — PHÂN TÍCH HÓA-LÝ TOÀN DIỆN")
-        print("="*60)
-        print(format_report(avg_chem,"Model 10 — RIER (train samples avg)",show_composition=True))
+    # Plots
+    plot_loss_curve(train_losses, val_losses, MODEL_NUM, save_dir)
+    plot_scatter_aggregated(Y_test, Y_pred, sid_test, MODEL_NUM, save_dir)
+    plot_scatter_raw(Y_test, Y_pred, sid_test, MODEL_NUM, save_dir)
+    plot_radial_diagram(gate_weights, save_dir, MODEL_NUM)
+    save_results(metrics, MODEL_NUM, save_dir)
 
-        # ── 2. Per-sample chemistry ───────────────────────────────────────
-        print(); print("  Per-sample physicochemical properties:")
-        print(f"  {'Sample':<8} {'pI':>6} {'pH':>7} {'Polar':>7} {'Hydro':>7} {'Arom':>7} {'Struct'}")
-        print(f"  {'─'*58}")
-        for i, (prof, sid_i) in enumerate(zip(train_profiles, range(len(train_profiles)))):
-            pi_est=prof.estimated_pI if prof.estimated_pI>0 else 0.
-            print(f"  {str(sid_i):<8} {pi_est:>6.2f} {prof.pH_score:>+7.3f} "
-                  f"{prof.polarity:>7.3f} {prof.hydrophilicity:>7.3f} "
-                  f"{prof.aromaticity:>7.4f} {prof.secondary_structure[:12]}")
+    avg_chem = post_process_advanced_model(Xt, wavenumbers, Y_pred, sid_test, MODEL_NUM, save_dir)
+    metrics["chemistry"] = avg_chem
 
-        # ── 3. Bond contribution plot ─────────────────────────────────────
-        plot_bond_contribution(avg_chem,"M10-RIER",
-                               os.path.join(get_model_dir(10),"model10_chemistry_bonds.png"))
-
-        # ── 4. Spoke × Chemistry correlation ──────────────────────────────
-        spoke_chem = {}
-        for k, (sname, z) in enumerate(zip(SPOKE_NAMES, lats_te)):
-            # Mutual info của spoke latent với chemistry properties
-            from utils import mutual_info_score
-            chem_targets = np.column_stack([
-                [p.pH_score for p in train_profiles],
-                [p.polarity for p in train_profiles],
-                [p.hydrophilicity for p in train_profiles],
-                [p.aromaticity for p in train_profiles],
-            ])[:len(z)]
-            if len(chem_targets) > 1 and len(z) > 1:
-                mi = mutual_info_score(z[:len(chem_targets)], chem_targets)
-            else: mi = 0.
-            spoke_chem[sname] = {"latent_chem_mi": float(mi),
-                                  "gate_weight": float(gates_te[:,k].mean())}
-
-        print("  Spoke → Chemistry MI:")
-        for sn, sv in sorted(spoke_chem.items(), key=lambda x:x[1]["latent_chem_mi"], reverse=True):
-            print(f"    {sn:<12}: MI={sv['latent_chem_mi']:.4f}  Gate={sv['gate_weight']:.4f}")
-
-        # ── 5. Save everything ────────────────────────────────────────────
-        out = {
-            "model": 10, "n_spokes": 8,
-            "avg_profile": asdict(avg_chem),
-            "spoke_chemistry_mi": spoke_chem,
-            "information_report": info,
-            "per_sample": [
-                {"estimated_pI":p.estimated_pI,"pH_score":p.pH_score,
-                 "polarity":p.polarity,"hydrophilicity":p.hydrophilicity,
-                 "aromaticity":p.aromaticity,"bond_strength":p.bond_strength,
-                 "aliphatic_index":p.aliphatic_index,"carboxylate_ratio":p.carboxylate_ratio,
-                 "crystallinity_proxy":p.crystallinity_proxy,"spectral_entropy":p.spectral_entropy,
-                 "secondary_structure":p.secondary_structure,"dominant_bond":p.dominant_bond}
-                for p in train_profiles
-            ]
-        }
-        with open(os.path.join(get_model_dir(10),"model10_chemistry.json"),"w") as ff:
-            json.dump(out,ff,indent=2,
-                      default=lambda x:float(x) if hasattr(x,"__float__") else str(x))
-        log.info("  ✓ RIER chemistry analysis saved to model10_chemistry.json")
-
-    except Exception as _ce:
-        import traceback as _tb
-        log.warning(f"  Chemistry lỗi: {_ce}"); log.warning(_tb.format_exc())
-
-    save_results(10,mte,{"Y_pred":Yp_te,"Y_true":Y_test,"gates":gates_te},
-                 {"name":"RIER","elapsed_s":elapsed,
-                  "information_report":{k:{sk:float(sv) for sk,sv in v.items()} if isinstance(v,dict) else float(v) for k,v in info.items()},
-                  "train_metrics":mtr})
-    return Yp_te,mte
-
-if __name__=="__main__":
-    import argparse; from config import DATA_FILE
-    from utils import load_data, aggregate_by_sample, split_data
-    p=argparse.ArgumentParser(); p.add_argument("--data",default=DATA_FILE); p.add_argument("--retrain",action="store_true"); a=p.parse_args()
-    X,Y,s,w=load_data(a.data); Xa,Ya,sa=aggregate_by_sample(X,Y,s)
-    Xtr,Xte,Ytr,Yte,_,_=split_data(Xa,Ya,sa); run(Xtr,Xte,Ytr,Yte,w,a.retrain)
+    gc.collect()
+    return Y_pred, metrics
